@@ -2,6 +2,13 @@
 
 set -e -o pipefail
 
+# Check for force update flag
+FORCE_UPDATE=false
+if [ -f "/.force_update" ]; then
+    echo "Force update flag detected at /.force_update"
+    FORCE_UPDATE=true
+fi
+
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 
 SERVER_DIR="$WORKSPACE_DIR/vast-pyworker"
@@ -47,13 +54,19 @@ JSON
 }
 
 function install_vastai_sdk() {
+    local force_flag=""
+    if [ "$FORCE_UPDATE" = true ]; then
+        force_flag="--force-reinstall"
+        echo "Force reinstalling vastai-sdk"
+    fi
+
     # If SDK_BRANCH is set, install vastai-sdk from the vast-sdk repo at that branch/tag/commit.
     if [ -n "${SDK_BRANCH:-}" ]; then
         if [ -n "${SDK_VERSION:-}" ]; then
             echo "WARNING: Both SDK_BRANCH and SDK_VERSION are set; using SDK_BRANCH=${SDK_BRANCH}"
         fi
         echo "Installing vastai-sdk from https://github.com/vast-ai/vast-sdk/ @ ${SDK_BRANCH}"
-        if ! uv pip install "vastai-sdk @ git+https://github.com/vast-ai/vast-sdk.git@${SDK_BRANCH}"; then
+        if ! uv pip install $force_flag "vastai-sdk @ git+https://github.com/vast-ai/vast-sdk.git@${SDK_BRANCH}"; then
             report_error_and_exit "Failed to install vastai-sdk from vast-ai/vast-sdk@${SDK_BRANCH}"
         fi
         return 0
@@ -61,14 +74,14 @@ function install_vastai_sdk() {
 
     if [ -n "${SDK_VERSION:-}" ]; then
         echo "Installing vastai-sdk version ${SDK_VERSION}"
-        if ! uv pip install "vastai-sdk==${SDK_VERSION}"; then
+        if ! uv pip install $force_flag "vastai-sdk==${SDK_VERSION}"; then
             report_error_and_exit "Failed to install vastai-sdk==${SDK_VERSION}"
         fi
         return 0
     fi
 
     echo "Installing default vastai-sdk"
-    if ! uv pip install vastai-sdk; then
+    if ! uv pip install $force_flag vastai-sdk; then
         report_error_and_exit "Failed to install vastai-sdk"
     fi
 }
@@ -132,10 +145,27 @@ then
         if ! git clone "${PYWORKER_REPO:-https://github.com/vast-ai/pyworker}" "$SERVER_DIR"; then
             report_error_and_exit "Failed to clone pyworker repository"
         fi
+    elif [ "$FORCE_UPDATE" = true ]; then
+        echo "Force updating pyworker repository"
+        if ! (cd "$SERVER_DIR" && git fetch --all); then
+            report_error_and_exit "Failed to fetch pyworker repository updates"
+        fi
     fi
     if [[ -n ${PYWORKER_REF:-} ]]; then
-        if ! (cd "$SERVER_DIR" && git checkout "$PYWORKER_REF"); then
-            report_error_and_exit "Failed to checkout pyworker reference: $PYWORKER_REF"
+        if [ "$FORCE_UPDATE" = true ]; then
+            echo "Force updating to pyworker reference: $PYWORKER_REF"
+            if ! (cd "$SERVER_DIR" && git fetch --all && git checkout "$PYWORKER_REF" && git pull); then
+                report_error_and_exit "Failed to force update pyworker reference: $PYWORKER_REF"
+            fi
+        else
+            if ! (cd "$SERVER_DIR" && git checkout "$PYWORKER_REF"); then
+                report_error_and_exit "Failed to checkout pyworker reference: $PYWORKER_REF"
+            fi
+        fi
+    elif [ "$FORCE_UPDATE" = true ]; then
+        echo "Force updating pyworker to latest"
+        if ! (cd "$SERVER_DIR" && git pull); then
+            report_error_and_exit "Failed to pull latest pyworker changes"
         fi
     fi
 
@@ -167,6 +197,44 @@ else
     fi
     echo "environment activated"
     echo "venv: $VIRTUAL_ENV"
+
+    # Handle force update for existing environment
+    if [ "$FORCE_UPDATE" = true ]; then
+        echo "Performing force update on existing environment"
+
+        # Update pyworker repository
+        if [[ -d $SERVER_DIR ]]; then
+            echo "Force updating pyworker repository"
+            if ! (cd "$SERVER_DIR" && git fetch --all); then
+                report_error_and_exit "Failed to fetch pyworker repository updates"
+            fi
+
+            if [[ -n ${PYWORKER_REF:-} ]]; then
+                echo "Force updating to pyworker reference: $PYWORKER_REF"
+                if ! (cd "$SERVER_DIR" && git checkout "$PYWORKER_REF" && git pull); then
+                    report_error_and_exit "Failed to force update pyworker reference: $PYWORKER_REF"
+                fi
+            else
+                echo "Force updating pyworker to latest"
+                if ! (cd "$SERVER_DIR" && git pull); then
+                    report_error_and_exit "Failed to pull latest pyworker changes"
+                fi
+            fi
+        fi
+
+        # Force reinstall SDK
+        install_vastai_sdk
+    fi
+fi
+
+# Remove force update flag after successful update
+if [ "$FORCE_UPDATE" = true ]; then
+    echo "Removing force update flag"
+    if ! rm -f "/.force_update"; then
+        echo "WARNING: Failed to remove /.force_update, continuing anyway"
+    else
+        echo "Force update completed successfully"
+    fi
 fi
 
 if [ "$USE_SSL" = true ]; then
