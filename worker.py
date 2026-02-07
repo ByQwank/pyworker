@@ -234,6 +234,20 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def calculate_workload(payload: dict[str, Any]) -> float:
+    if not isinstance(payload, dict):
+        return 150.0
+
+    input_payload = payload.get("input")
+    if isinstance(input_payload, dict):
+        if "workflow_json" in input_payload:
+            return 10000.0
+        if "modifier" in input_payload:
+            return 150.0
+
+    return 300.0
+
+
 benchmark_prompts = [
     "Cartoon hoodie hero; orc, anime cat, bunny; black goo; buff; vector on white.",
     "Cozy farming-game scene with fine details.",
@@ -272,8 +286,13 @@ worker_config = WorkerConfig(
             allow_parallel_requests=False,
             max_queue_time=float(os.getenv("PYWORKER_MAX_QUEUE_TIME_SECONDS", "1800")),
             request_parser=ensure_required_loras,
-            workload_calculator=lambda _payload: 100.0,
-            benchmark_config=BenchmarkConfig(dataset=benchmark_dataset),
+            workload_calculator=calculate_workload,
+            benchmark_config=BenchmarkConfig(
+                dataset=benchmark_dataset,
+                runs=1,
+                concurrency=1,
+                do_warmup=False,
+            ),
         )
     ],
     log_action_config=LogActionConfig(
