@@ -9,6 +9,23 @@ This repository contains **example PyWorkers** used by Vast.ai’s default Serve
 - Optionally supports FIFO queueing when the backend cannot process concurrent requests
 - Detects readiness/failure from model logs and runs a benchmark to estimate throughput
 
+## Custom ComfyUI Worker in this fork
+
+This fork includes a root `worker.py` tailored for ComfyUI JSON workloads.
+
+- `allow_parallel_requests=False` to prevent concurrent workflow execution on a single ComfyUI backend.
+- Dynamic LoRA fetch on each request (only the LoRAs referenced by the current workflow are downloaded).
+- Optional signed LoRA manifests from your backend (`lora_manifest`) so workers only accept approved LoRA lists.
+
+Environment variables used by this custom worker:
+
+- `HF_LORA_REPO` (default: `Dylaaann/Lora`)
+- `COMFY_LORA_DIR` (default: `/workspace/ComfyUI/models/loras`)
+- `PYWORKER_MAX_QUEUE_TIME_SECONDS` (default: `1800`)
+- `PYWORKER_MANIFEST_SECRET` (optional; enables HMAC verification for `lora_manifest`)
+- `PYWORKER_MANIFEST_MAX_AGE_SECONDS` (default: `900`)
+- `PYWORKER_REQUIRE_MANIFEST` (`true`/`false`, default: `false`)
+
 > Important: The **core PyWorker framework** (Worker, WorkerConfig, HandlerConfig, BenchmarkConfig, LogActionConfig) is provided by the **`vastai` / `vastai-sdk`** Python package (https://github.com/vast-ai/vast-sdk). This repo focuses on *worker implementations and examples*, not the framework internals.
 
 ## Repository Purpose

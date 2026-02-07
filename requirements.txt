@@ -1,1 +1,2 @@
 vastai-sdk>=0.3.0
+huggingface_hub>=0.28.0
