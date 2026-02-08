@@ -1,60 +1,187 @@
+import json
+import math
+import os
 import random
 import sys
 
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
 # ComyUI model configuration
-MODEL_SERVER_URL           = 'http://127.0.0.1'
-MODEL_SERVER_PORT          = 18288
-MODEL_LOG_FILE             = '/var/log/portal/comfyui.log'
+MODEL_SERVER_URL = "http://127.0.0.1"
+MODEL_SERVER_PORT = 18288
+MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
 MODEL_HEALTHCHECK_ENDPOINT = "/health"
 
 # ComyUI-specific log messages
-MODEL_LOAD_LOG_MSG = [
-    "To see the GUI go to: "
-]
+MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
 
 MODEL_ERROR_LOG_MSGS = [
     "MetadataIncompleteBuffer",
     "Value not in list: ",
-    "[ERROR] Provisioning Script failed"
+    "[ERROR] Provisioning Script failed",
 ]
 
-MODEL_INFO_LOG_MSGS = [
-    '"message":"Downloading'
-]
+MODEL_INFO_LOG_MSGS = ['"message":"Downloading']
 
-benchmark_prompts = [
-    "Cartoon hoodie hero; orc, anime cat, bunny; black goo; buff; vector on white.",
-    "Cozy farming-game scene with fine details.",
-    "2D vector child with soccer ball; airbrush chrome; swagger; antique copper.",
-    "Realistic futuristic downtown of low buildings at sunset.",
-    "Perfect wave front view; sunny seascape; ultra-detailed water; artful feel.",
-    "Clear cup with ice, fruit, mint; creamy swirls; fluid-sim CGI; warm glow.",
-    "Male biker with backpack on motorcycle; oilpunk; award-worthy magazine cover.",
-    "Collage for textile; surreal cartoon cat in cap/jeans before poster; crisp.",
-    "Medieval village inside glass sphere; volumetric light; macro focus.",
-    "Iron Man with glowing axe; mecha sci-fi; jungle scene; dynamic light.",
-    "Pope Francis DJ in leather jacket, mixing on giant console; dramatic.",
-]
+DEFAULT_WIDTH = 432
+DEFAULT_HEIGHT = 768
+DEFAULT_FRAMES = 17
+DEFAULT_STEPS = 8
+
+MAX_QUEUE_TIME = float(os.environ.get("MAX_QUEUE_TIME", "900"))
+WORKLOAD_MULTIPLIER = float(os.environ.get("WORKLOAD_MULTIPLIER", "3"))
+
+BENCHMARK_WORKFLOW_PATH = os.environ.get(
+    "BENCHMARK_WORKFLOW_PATH",
+    os.path.join(os.path.dirname(__file__), "benchmark-wan22-fast.json"),
+)
 
 
+def load_benchmark_workflow():
+    try:
+        with open(BENCHMARK_WORKFLOW_PATH, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as exc:
+        print(f"Failed to load benchmark workflow: {exc}")
+        return None
 
-benchmark_dataset = [
-    {
-        "input": {
-            "request_id": f"test-{random.randint(1000, 99999)}",
-            "modifier": "Text2Image",
-            "modifications": {
-                "prompt": prompt,
-                "width": 512,
-                "height": 512,
-                "steps": 20,
-                "seed": random.randint(0, sys.maxsize)
+
+def parse_numeric_value(value):
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        try:
+            parsed = float(trimmed)
+            return parsed if math.isfinite(parsed) else None
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_numeric_input(input_value, workflow, visited, depth=0):
+    if depth > 6:
+        return None
+    direct = parse_numeric_value(input_value)
+    if direct is not None:
+        return direct
+
+    if isinstance(input_value, list) and len(input_value) > 0:
+        node_id = str(input_value[0])
+        if node_id in visited:
+            return None
+        node = workflow.get(node_id)
+        if not node or "inputs" not in node:
+            return None
+        visited.add(node_id)
+        inputs = node.get("inputs") or {}
+
+        value = parse_numeric_value(inputs.get("value"))
+        if value is not None:
+            return value
+
+        a = resolve_numeric_input(inputs.get("a"), workflow, visited, depth + 1)
+        b = resolve_numeric_input(inputs.get("b"), workflow, visited, depth + 1)
+        operation = inputs.get("operation")
+        op = operation.lower() if isinstance(operation, str) else None
+        if a is not None and b is not None:
+            if op in {"add", "+"}:
+                return a + b
+            if op in {"subtract", "-"}:
+                return a - b
+            if op in {"multiply", "*"}:
+                return a * b
+            if op in {"divide", "/"}:
+                return None if b == 0 else a / b
+
+        expression = inputs.get("value")
+        if isinstance(expression, str) and a is not None and b is not None:
+            expr = expression.replace(" ", "")
+            if "a*b" in expr:
+                return a * b
+            if "a+b" in expr:
+                return a + b
+            if "a-b" in expr:
+                return a - b
+            if "a/b" in expr:
+                return None if b == 0 else a / b
+
+    return None
+
+
+def extract_workflow(payload):
+    if not isinstance(payload, dict):
+        return None
+    root = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    if not isinstance(root, dict):
+        return None
+    inner = root.get("input") if isinstance(root.get("input"), dict) else None
+    if not isinstance(inner, dict):
+        return None
+    workflow = inner.get("workflow_json")
+    return workflow if isinstance(workflow, dict) else None
+
+
+def estimate_workload(workflow):
+    width = None
+    height = None
+    frames = None
+
+    for node in workflow.values():
+        if node.get("class_type") == "WanImageToVideo":
+            inputs = node.get("inputs") or {}
+            width = resolve_numeric_input(inputs.get("width"), workflow, set())
+            height = resolve_numeric_input(inputs.get("height"), workflow, set())
+            frames = resolve_numeric_input(inputs.get("length"), workflow, set())
+            break
+
+    width = width or DEFAULT_WIDTH
+    height = height or DEFAULT_HEIGHT
+    frames = frames or DEFAULT_FRAMES
+
+    steps_total = None
+    for node in workflow.values():
+        if node.get("class_type") != "KSamplerAdvanced":
+            continue
+        inputs = node.get("inputs") or {}
+        end_at = resolve_numeric_input(inputs.get("end_at_step"), workflow, set())
+        steps = resolve_numeric_input(inputs.get("steps"), workflow, set())
+        candidate = end_at or steps
+        if candidate is None:
+            continue
+        steps_total = candidate if steps_total is None else max(steps_total, candidate)
+
+    steps_total = steps_total or DEFAULT_STEPS
+
+    grid_w = math.ceil(width / 512)
+    grid_h = math.ceil(height / 512)
+    base_workload = grid_w * grid_h * frames * steps_total
+    multiplier = WORKLOAD_MULTIPLIER if WORKLOAD_MULTIPLIER > 0 else 1.0
+    return max(1.0, base_workload * multiplier)
+
+
+def workload_calculator(payload):
+    workflow = extract_workflow(payload)
+    if not workflow:
+        return DEFAULT_WIDTH * DEFAULT_HEIGHT
+    return estimate_workload(workflow)
+
+
+benchmark_workflow = load_benchmark_workflow()
+benchmark_dataset = (
+    [
+        {
+            "input": {
+                "request_id": f"benchmark-{random.randint(1000, 99999)}",
+                "workflow_json": benchmark_workflow,
             }
         }
-    } for prompt in benchmark_prompts
-]
+    ]
+    if benchmark_workflow
+    else []
+)
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
@@ -65,7 +192,8 @@ worker_config = WorkerConfig(
         HandlerConfig(
             route="/generate/sync",
             allow_parallel_requests=False,
-            max_queue_time=10.0,
+            max_queue_time=MAX_QUEUE_TIME,
+            workload_calculator=workload_calculator,
             benchmark_config=BenchmarkConfig(
                 dataset=benchmark_dataset,
             )
