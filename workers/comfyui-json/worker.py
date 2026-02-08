@@ -28,12 +28,11 @@ DEFAULT_HEIGHT = 768
 DEFAULT_FRAMES = 17
 DEFAULT_STEPS = 8
 
-MAX_QUEUE_TIME = float(os.environ.get("MAX_QUEUE_TIME", "900"))
-WORKLOAD_MULTIPLIER = float(os.environ.get("WORKLOAD_MULTIPLIER", "3"))
+MAX_QUEUE_TIME = 900.0
+WORKLOAD_MULTIPLIER = 0.6
 
-BENCHMARK_WORKFLOW_PATH = os.environ.get(
-    "BENCHMARK_WORKFLOW_PATH",
-    os.path.join(os.path.dirname(__file__), "benchmark-wan22-fast.json"),
+BENCHMARK_WORKFLOW_PATH = os.path.join(
+    os.path.dirname(__file__), "benchmark-wan22-fast.json"
 )
 
 
@@ -114,14 +113,23 @@ def resolve_numeric_input(input_value, workflow, visited, depth=0):
 def extract_workflow(payload):
     if not isinstance(payload, dict):
         return None
-    root = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
-    if not isinstance(root, dict):
-        return None
-    inner = root.get("input") if isinstance(root.get("input"), dict) else None
-    if not isinstance(inner, dict):
-        return None
-    workflow = inner.get("workflow_json")
-    return workflow if isinstance(workflow, dict) else None
+
+    if isinstance(payload.get("workflow_json"), dict):
+        return payload.get("workflow_json")
+
+    input_data = payload.get("input")
+    if isinstance(input_data, dict) and isinstance(input_data.get("workflow_json"), dict):
+        return input_data.get("workflow_json")
+
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        return extract_workflow(nested)
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return extract_workflow(data)
+
+    return None
 
 
 def estimate_workload(workflow):
@@ -165,7 +173,7 @@ def estimate_workload(workflow):
 def workload_calculator(payload):
     workflow = extract_workflow(payload)
     if not workflow:
-        return DEFAULT_WIDTH * DEFAULT_HEIGHT
+        return estimate_workload({})
     return estimate_workload(workflow)
 
 
