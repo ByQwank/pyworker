@@ -19,7 +19,7 @@
     "inputs": {
       "toggle": false,
       "mode": "simple",
-      "num_loras": 0,
+      "num_loras": 1,
       "lora_1_name": "None",
       "lora_1_strength": 1,
       "lora_1_model_strength": 1,
@@ -610,7 +610,7 @@
     "inputs": {
       "toggle": false,
       "mode": "simple",
-      "num_loras": 0,
+      "num_loras": 1,
       "lora_1_name": "None",
       "lora_1_strength": 1,
       "lora_1_model_strength": 1,
