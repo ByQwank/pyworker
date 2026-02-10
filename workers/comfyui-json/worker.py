@@ -1,4 +1,3 @@
-import base64
 import fcntl
 import hashlib
 import hmac
@@ -44,7 +43,6 @@ WORKLOAD_MULTIPLIER = 0.6
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora")
 HF_LORA_TOKEN = os.getenv("HF_TOKEN")
 COMFY_LORA_DIR = Path(os.getenv("COMFY_LORA_DIR", "/workspace/ComfyUI/models/loras"))
-COMFY_INPUT_DIR = Path(os.getenv("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 MANIFEST_SECRET = os.getenv("PYWORKER_MANIFEST_SECRET", "").strip()
 MANIFEST_MAX_AGE_SECONDS = int(os.getenv("PYWORKER_MANIFEST_MAX_AGE_SECONDS", "900"))
 REQUIRE_SIGNED_MANIFEST = os.getenv("PYWORKER_REQUIRE_MANIFEST", "false").lower() == "true"
@@ -53,10 +51,6 @@ IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
 
 log = logging.getLogger("custom-comfyui-json-worker")
-
-BENCHMARK_WORKFLOW_PATH = os.path.join(
-    os.path.dirname(__file__), "benchmark-wan22-fast.json"
-)
 
 
 def canonical_json(value: Any) -> str:
@@ -194,22 +188,6 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
     return target_path
 
 
-def ensure_benchmark_image_present() -> None:
-    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    target_path = COMFY_INPUT_DIR / "benchmark.png"
-    if target_path.exists():
-        return
-
-    # 1x1 transparent PNG
-    png_b64 = (
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B3SIAAAAASUVORK5CYII="
-    )
-    try:
-        target_path.write_bytes(base64.b64decode(png_b64))
-    except Exception as exc:
-        log.warning("Failed to write benchmark image: %s", exc)
-
-
 def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be an object.")
@@ -222,8 +200,6 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(workflow_json, dict):
         # Allow modifier-mode requests that do not send a workflow_json payload.
         return payload
-
-    ensure_benchmark_image_present()
 
     requested_loras_raw = input_payload.get("required_loras")
     requested_loras: list[str] = []
@@ -274,15 +250,6 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     input_payload["required_loras"] = required_loras
     payload["input"] = input_payload
     return payload
-
-
-def load_benchmark_workflow():
-    try:
-        with open(BENCHMARK_WORKFLOW_PATH, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception as exc:
-        print(f"Failed to load benchmark workflow: {exc}")
-        return None
 
 
 def parse_numeric_value(value):
@@ -417,19 +384,33 @@ def workload_calculator(payload):
     return estimate_workload(workflow)
 
 
-benchmark_workflow = load_benchmark_workflow()
-benchmark_dataset = (
-    [
-        {
-            "input": {
-                "request_id": f"benchmark-{random.randint(1000, 99999)}",
-                "workflow_json": benchmark_workflow,
-            }
+benchmark_prompts = [
+    "Cartoon hoodie hero; orc, anime cat, bunny; black goo; buff; vector on white.",
+    "Cozy farming-game scene with fine details.",
+    "2D vector child with soccer ball; airbrush chrome; swagger; antique copper.",
+    "Realistic futuristic downtown of low buildings at sunset.",
+    "Perfect wave front view; sunny seascape; ultra-detailed water; artful feel.",
+    "Clear cup with ice, fruit, mint; creamy swirls; fluid-sim CGI; warm glow.",
+    "Male biker with backpack on motorcycle; oilpunk; award-worthy magazine cover.",
+    "Collage for textile; surreal cartoon cat in cap/jeans before poster; crisp.",
+]
+
+benchmark_dataset = [
+    {
+        "input": {
+            "request_id": f"benchmark-{random.randint(1000, 99999)}",
+            "modifier": "Text2Image",
+            "modifications": {
+                "prompt": prompt,
+                "width": 512,
+                "height": 512,
+                "steps": 20,
+                "seed": random.randint(0, sys.maxsize),
+            },
         }
-    ]
-    if benchmark_workflow
-    else []
-)
+    }
+    for prompt in benchmark_prompts
+]
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
