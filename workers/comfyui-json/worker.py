@@ -1,3 +1,4 @@
+import base64
 import fcntl
 import hashlib
 import hmac
@@ -46,9 +47,13 @@ WORKLOAD_MULTIPLIER = 0.6
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora")
 HF_LORA_TOKEN = os.getenv("HF_TOKEN")
 COMFY_LORA_DIR = Path(os.getenv("COMFY_LORA_DIR", "/workspace/ComfyUI/models/loras"))
+COMFY_INPUT_DIR = Path(os.getenv("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 MANIFEST_SECRET = os.getenv("PYWORKER_MANIFEST_SECRET", "").strip()
 MANIFEST_MAX_AGE_SECONDS = int(os.getenv("PYWORKER_MANIFEST_MAX_AGE_SECONDS", "900"))
 REQUIRE_SIGNED_MANIFEST = os.getenv("PYWORKER_REQUIRE_MANIFEST", "false").lower() == "true"
+BENCHMARK_WORKFLOW_PATH = Path(os.path.join(os.path.dirname(__file__), "misc", "benchmark.json"))
+BENCHMARK_IMAGE_NAME = "benchmark.png"
+RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
 
 IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
@@ -191,6 +196,75 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
     return target_path
 
 
+def ensure_benchmark_image_present() -> None:
+    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = COMFY_INPUT_DIR / BENCHMARK_IMAGE_NAME
+    if target_path.exists():
+        return
+
+    # 1x1 transparent PNG
+    png_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B3SIAAAAASUVORK5CYII="
+    )
+    try:
+        target_path.write_bytes(base64.b64decode(png_b64))
+        log.info("Created benchmark image at %s", target_path)
+    except Exception as exc:
+        log.warning("Failed to write benchmark image: %s", exc)
+
+
+def materialize_random_placeholders(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: materialize_random_placeholders(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [materialize_random_placeholders(item) for item in value]
+    if isinstance(value, str) and value.strip() == RANDOM_INT_PLACEHOLDER:
+        return random.randint(0, sys.maxsize)
+    return value
+
+
+def workflow_references_benchmark_image(workflow_json: dict[str, Any]) -> bool:
+    for node in workflow_json.values():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "LoadImage":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        image_name = inputs.get("image")
+        if isinstance(image_name, str) and image_name.strip() == BENCHMARK_IMAGE_NAME:
+            return True
+    return False
+
+
+def load_custom_benchmark_workflow() -> dict[str, Any] | None:
+    if not BENCHMARK_WORKFLOW_PATH.exists():
+        return None
+
+    try:
+        with BENCHMARK_WORKFLOW_PATH.open("r", encoding="utf-8") as file:
+            parsed = json.load(file)
+    except Exception as exc:
+        log.warning("Failed to load benchmark workflow from %s: %s", BENCHMARK_WORKFLOW_PATH, exc)
+        return None
+
+    if not isinstance(parsed, dict):
+        log.warning("Benchmark workflow in %s must be a JSON object", BENCHMARK_WORKFLOW_PATH)
+        return None
+
+    workflow_json = materialize_random_placeholders(parsed)
+    if not isinstance(workflow_json, dict):
+        log.warning("Benchmark workflow in %s resolved to an invalid value", BENCHMARK_WORKFLOW_PATH)
+        return None
+
+    if workflow_references_benchmark_image(workflow_json):
+        ensure_benchmark_image_present()
+
+    log.info("Loaded custom benchmark workflow from %s", BENCHMARK_WORKFLOW_PATH)
+    return workflow_json
+
+
 def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be an object.")
@@ -202,6 +276,11 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     workflow_json = input_payload.get("workflow_json")
     if not isinstance(workflow_json, dict):
         # Allow modifier-mode requests that do not send a workflow_json payload.
+        return payload
+
+    request_id = input_payload.get("request_id")
+    if isinstance(request_id, str) and request_id.startswith("benchmark-"):
+        # Benchmark requests should not depend on runtime LoRA fetches.
         return payload
 
     requested_loras_raw = input_payload.get("required_loras")
@@ -376,6 +455,28 @@ def estimate_workload(workflow):
     grid_w = math.ceil(width / 512)
     grid_h = math.ceil(height / 512)
     base_workload = grid_w * grid_h * frames * steps_total
+
+    class_types = []
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if isinstance(class_type, str):
+            class_types.append(class_type.lower())
+
+    has_rife = any("rife" in class_type for class_type in class_types)
+    has_upscale = any("upscale" in class_type for class_type in class_types)
+    video_combine_count = sum(
+        1 for class_type in class_types if "video" in class_type and "combine" in class_type
+    )
+
+    if has_rife:
+        base_workload *= 1.35
+    if has_upscale:
+        base_workload *= 1.25
+    if video_combine_count > 1:
+        base_workload *= 1 + (video_combine_count - 1) * 0.15
+
     multiplier = WORKLOAD_MULTIPLIER if WORKLOAD_MULTIPLIER > 0 else 1.0
     return max(1.0, base_workload * multiplier)
 
@@ -387,7 +488,7 @@ def workload_calculator(payload):
     return estimate_workload(workflow)
 
 
-benchmark_prompts = [
+fallback_benchmark_prompts = [
     "Cartoon hoodie hero; orc, anime cat, bunny; black goo; buff; vector on white.",
     "Cozy farming-game scene with fine details.",
     "2D vector child with soccer ball; airbrush chrome; swagger; antique copper.",
@@ -398,22 +499,33 @@ benchmark_prompts = [
     "Collage for textile; surreal cartoon cat in cap/jeans before poster; crisp.",
 ]
 
-benchmark_dataset = [
-    {
-        "input": {
-            "request_id": f"benchmark-{random.randint(1000, 99999)}",
-            "modifier": "Text2Image",
-            "modifications": {
-                "prompt": prompt,
-                "width": 512,
-                "height": 512,
-                "steps": 20,
-                "seed": random.randint(0, sys.maxsize),
-            },
+custom_benchmark_workflow = load_custom_benchmark_workflow()
+if custom_benchmark_workflow:
+    benchmark_dataset = [
+        {
+            "input": {
+                "request_id": f"benchmark-{random.randint(1000, 99999)}",
+                "workflow_json": custom_benchmark_workflow,
+            }
         }
-    }
-    for prompt in benchmark_prompts
-]
+    ]
+else:
+    benchmark_dataset = [
+        {
+            "input": {
+                "request_id": f"benchmark-{random.randint(1000, 99999)}",
+                "modifier": "Text2Image",
+                "modifications": {
+                    "prompt": prompt,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 20,
+                    "seed": random.randint(0, sys.maxsize),
+                },
+            }
+        }
+        for prompt in fallback_benchmark_prompts
+    ]
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,

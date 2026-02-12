@@ -1,0 +1,423 @@
+{
+  "8": {
+    "inputs": {
+      "samples": [
+        "631",
+        0
+      ],
+      "vae": [
+        "365",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "Frames"
+    }
+  },
+  "365": {
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "529": {
+    "inputs": {
+      "text": [
+        "626",
+        0
+      ],
+      "clip": [
+        "550",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Positive"
+    }
+  },
+  "530": {
+    "inputs": {
+      "text": [
+        "627",
+        0
+      ],
+      "clip": [
+        "550",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Negative"
+    }
+  },
+  "549": {
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load High Noise UNet"
+    }
+  },
+  "550": {
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "554": {
+    "inputs": {
+      "width": 432,
+      "height": 768,
+      "length": [
+        "567",
+        0
+      ],
+      "batch_size": 1,
+      "positive": [
+        "529",
+        0
+      ],
+      "negative": [
+        "530",
+        0
+      ],
+      "vae": [
+        "365",
+        0
+      ],
+      "start_image": [
+        "643",
+        0
+      ]
+    },
+    "class_type": "WanImageToVideo",
+    "_meta": {
+      "title": "WanImageToVideo"
+    }
+  },
+  "555": {
+    "inputs": {
+      "nag_scale": 11,
+      "nag_alpha": 0.25,
+      "nag_tau": 2.5,
+      "input_type": "default",
+      "model": [
+        "549",
+        0
+      ],
+      "conditioning": [
+        "530",
+        0
+      ]
+    },
+    "class_type": "WanVideoNAG",
+    "_meta": {
+      "title": "High Noise NAG"
+    }
+  },
+  "556": {
+    "inputs": {
+      "shift": 8,
+      "model": [
+        "555",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "High Noise Shift"
+    }
+  },
+  "557": {
+    "inputs": {
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "benchmark-wan22",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": false,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Combine Images to Video"
+    }
+  },
+  "565": {
+    "inputs": {
+      "value": 2
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "Video Length in Seconds"
+    }
+  },
+  "566": {
+    "inputs": {
+      "a": [
+        "565",
+        0
+      ],
+      "b": 16,
+      "operation": "multiply"
+    },
+    "class_type": "easy mathInt",
+    "_meta": {
+      "title": "length x fps"
+    }
+  },
+  "567": {
+    "inputs": {
+      "a": [
+        "566",
+        0
+      ],
+      "b": 1,
+      "operation": "add"
+    },
+    "class_type": "easy mathInt",
+    "_meta": {
+      "title": "length"
+    }
+  },
+  "612": {
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Low Noise UNet"
+    }
+  },
+  "616": {
+    "inputs": {
+      "nag_scale": 11,
+      "nag_alpha": 0.25,
+      "nag_tau": 2.5,
+      "input_type": "default",
+      "model": [
+        "612",
+        0
+      ],
+      "conditioning": [
+        "530",
+        0
+      ]
+    },
+    "class_type": "WanVideoNAG",
+    "_meta": {
+      "title": "Low Noise NAG"
+    }
+  },
+  "626": {
+    "inputs": {
+      "value": "A person stands in soft light, gentle motion, cinematic, high detail."
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Positive Prompt"
+    }
+  },
+  "627": {
+    "inputs": {
+      "value": "low quality, blurry, distortion, artifacts, deformed, oversaturated"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Negative Prompt"
+    }
+  },
+  "629": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": "__RANDOM_INT__",
+      "steps": [
+        "634",
+        0
+      ],
+      "cfg": 2.5,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "start_at_step": 0,
+      "end_at_step": [
+        "632",
+        0
+      ],
+      "return_with_leftover_noise": "enable",
+      "model": [
+        "556",
+        0
+      ],
+      "positive": [
+        "554",
+        0
+      ],
+      "negative": [
+        "554",
+        1
+      ],
+      "latent_image": [
+        "554",
+        2
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "High Noise"
+    }
+  },
+  "630": {
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": 0,
+      "steps": [
+        "634",
+        0
+      ],
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "start_at_step": [
+        "632",
+        0
+      ],
+      "end_at_step": [
+        "633",
+        0
+      ],
+      "return_with_leftover_noise": "enable",
+      "model": [
+        "556",
+        0
+      ],
+      "positive": [
+        "554",
+        0
+      ],
+      "negative": [
+        "554",
+        1
+      ],
+      "latent_image": [
+        "629",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "Mid Noise"
+    }
+  },
+  "631": {
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": 0,
+      "steps": [
+        "634",
+        0
+      ],
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "start_at_step": [
+        "633",
+        0
+      ],
+      "end_at_step": [
+        "634",
+        0
+      ],
+      "return_with_leftover_noise": "disable",
+      "model": [
+        "636",
+        0
+      ],
+      "positive": [
+        "554",
+        0
+      ],
+      "negative": [
+        "554",
+        1
+      ],
+      "latent_image": [
+        "630",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "Low Noise"
+    }
+  },
+  "632": {
+    "inputs": {
+      "value": 4
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "Stage 1 End"
+    }
+  },
+  "633": {
+    "inputs": {
+      "value": 8
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "Stage 2 End"
+    }
+  },
+  "634": {
+    "inputs": {
+      "value": 12
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "Total Steps"
+    }
+  },
+  "636": {
+    "inputs": {
+      "shift": 8,
+      "model": [
+        "616",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "Low Noise Shift"
+    }
+  },
+  "643": {
+    "inputs": {
+      "image": "benchmark.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Benchmark Image"
+    }
+  }
+}

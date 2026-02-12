@@ -2,7 +2,7 @@
 
 This is the base PyWorker for ComfyUI. It provides a unified interface for running any ComfyUI workflow through a proxy-based architecture. See the [Serverless documentation](https://docs.vast.ai/serverless) for guides and how-to's.
 
-The cost for each request has a static value of `100`. ComfyUI does not handle concurrent workloads and there is no current provision to load multiple instances of ComfyUI per worker node.
+The worker rejects queued requests (`allow_parallel_requests=false`, `max_queue_time=0`) so one worker handles one generation at a time. Route cost is provided by the caller to `/route/` and should represent one request's workload.
 
 ## Instance Setup
 
@@ -104,17 +104,18 @@ Images will be saved locally AND uploaded to `s3://{bucket}/comfyui/{filename}`.
 
 ### Custom Benchmark Workflows
 
-You can provide a custom ComfyUI workflow for benchmarking by creating `workers/comfyui-json/misc/benchmark.json`. This allows you to test performance using your preferred models and workflow complexity.
+You can provide a custom ComfyUI workflow for benchmarking by creating `workers/comfyui-json/misc/benchmark.json`. This allows you to benchmark with your real workflow shape (for example Wan 2.2 I2V) instead of SD1.5 text-to-image.
 
 **Ways to provide the benchmark file:**
-- Fork this repository and add your `benchmark.json` file
-- Write the file during worker provisioning (onstart script or setup phase)
+- Keep the default `workers/comfyui-json/misc/benchmark.json` from this repo
+- Fork this repository and replace `benchmark.json` with your own workflow
+- Write/overwrite the file during worker provisioning (onstart script or setup phase)
 
-An example file is provided in the repository. To ensure varied generations, use the placeholder `__RANDOM_INT__` in place of static seed values - it will be replaced with a random integer for each benchmark run.
+Use the placeholder `__RANDOM_INT__` for seed-like values. The worker replaces it with a random integer when loading the benchmark workflow.
 
 ### Default Benchmark (Fallback)
 
-If `benchmark.json` is not available, a simple image generation benchmark runs when each worker initializes. This validates GPU performance and helps identify underperforming machines.
+If `benchmark.json` is not available, the worker falls back to a simple SD1.5 text-to-image benchmark when each worker initializes. This validates GPU performance and helps identify underperforming machines.
 
 The default benchmark uses Stable Diffusion v1.5 with ComfyUI's standard text-to-image workflow. Configure it using these environment variables:
 
