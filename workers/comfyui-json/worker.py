@@ -37,7 +37,10 @@ DEFAULT_HEIGHT = 768
 DEFAULT_FRAMES = 17
 DEFAULT_STEPS = 8
 
-MAX_QUEUE_TIME = 900.0
+# Enforce 1 worker = 1 generation:
+# if one request is already running, reject additional requests immediately
+# so callers can re-route to another worker.
+MAX_QUEUE_TIME = 0.0
 WORKLOAD_MULTIPLIER = 0.6
 
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora")
