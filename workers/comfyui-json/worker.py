@@ -54,6 +54,7 @@ REQUIRE_SIGNED_MANIFEST = os.getenv("PYWORKER_REQUIRE_MANIFEST", "false").lower(
 BENCHMARK_WORKFLOW_PATH = Path(os.path.join(os.path.dirname(__file__), "misc", "benchmark.json"))
 BENCHMARK_IMAGE_NAME = "benchmark.png"
 RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
+INVALID_BENCHMARK_IMAGE_VALUES = {"", "undefined", "none", "null"}
 
 IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
@@ -238,6 +239,25 @@ def workflow_references_benchmark_image(workflow_json: dict[str, Any]) -> bool:
     return False
 
 
+def normalize_benchmark_load_images(workflow_json: dict[str, Any]) -> int:
+    patched = 0
+    for node in workflow_json.values():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "LoadImage":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        image_name = inputs.get("image")
+        if not isinstance(image_name, str):
+            continue
+        if image_name.strip().lower() in INVALID_BENCHMARK_IMAGE_VALUES:
+            inputs["image"] = BENCHMARK_IMAGE_NAME
+            patched += 1
+    return patched
+
+
 def load_custom_benchmark_workflow() -> dict[str, Any] | None:
     if not BENCHMARK_WORKFLOW_PATH.exists():
         return None
@@ -258,7 +278,15 @@ def load_custom_benchmark_workflow() -> dict[str, Any] | None:
         log.warning("Benchmark workflow in %s resolved to an invalid value", BENCHMARK_WORKFLOW_PATH)
         return None
 
-    if workflow_references_benchmark_image(workflow_json):
+    patched_count = normalize_benchmark_load_images(workflow_json)
+    if patched_count > 0:
+        log.warning(
+            "Patched %d LoadImage nodes in benchmark workflow to use '%s'",
+            patched_count,
+            BENCHMARK_IMAGE_NAME,
+        )
+
+    if patched_count > 0 or workflow_references_benchmark_image(workflow_json):
         ensure_benchmark_image_present()
 
     log.info("Loaded custom benchmark workflow from %s", BENCHMARK_WORKFLOW_PATH)
