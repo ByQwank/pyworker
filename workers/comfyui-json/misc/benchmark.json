@@ -256,7 +256,7 @@
   },
   "565": {
     "inputs": {
-      "value": 2
+      "value": 1
     },
     "class_type": "easy int",
     "_meta": {
@@ -687,7 +687,7 @@
   },
   "633": {
     "inputs": {
-      "value": 2
+      "value": 4
     },
     "class_type": "easy int",
     "_meta": {
@@ -696,7 +696,7 @@
   },
   "634": {
     "inputs": {
-      "value": 2
+      "value": 6
     },
     "class_type": "easy int",
     "_meta": {
