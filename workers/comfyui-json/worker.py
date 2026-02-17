@@ -577,7 +577,36 @@ benchmark_config = (
 if ENABLE_BENCHMARK:
     log.info("Pyworker benchmark enabled (PYWORKER_ENABLE_BENCHMARK=true)")
 else:
-    log.info("Pyworker benchmark disabled (PYWORKER_ENABLE_BENCHMARK=false)")
+    log.info(
+        "Pyworker benchmark workflow disabled (PYWORKER_ENABLE_BENCHMARK=false), "
+        "using lightweight internal benchmark route"
+    )
+
+
+def benchmark_ping_generator() -> dict[str, Any]:
+    # Lightweight synthetic payload used only to satisfy pyworker startup benchmark
+    # in direct-instance mode where serverless autoscaling perf is not used.
+    return {"ping": True, "ts": time.time()}
+
+
+async def benchmark_ping_remote(**params):
+    return {"ok": True, "params": params}
+
+
+benchmark_handler_config = HandlerConfig(
+    route="/benchmark/ping",
+    allow_parallel_requests=True,
+    max_queue_time=MAX_QUEUE_TIME,
+    benchmark_config=BenchmarkConfig(
+        generator=benchmark_ping_generator,
+        runs=1,
+        concurrency=1,
+        do_warmup=False,
+    ),
+    remote_function=benchmark_ping_remote,
+)
+
+generate_handler_benchmark_config = benchmark_config if ENABLE_BENCHMARK else None
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
@@ -585,14 +614,15 @@ worker_config = WorkerConfig(
     model_log_file=MODEL_LOG_FILE,
     model_healthcheck_url=MODEL_HEALTHCHECK_ENDPOINT,
     handlers=[
+        benchmark_handler_config if not ENABLE_BENCHMARK else None,
         HandlerConfig(
             route="/generate/sync",
             allow_parallel_requests=False,
             max_queue_time=MAX_QUEUE_TIME,
             request_parser=ensure_required_loras,
             workload_calculator=workload_calculator,
-            benchmark_config=benchmark_config
-        )
+            benchmark_config=generate_handler_benchmark_config,
+        ),
     ],
     log_action_config=LogActionConfig(
         on_load=MODEL_LOAD_LOG_MSG,
@@ -600,5 +630,8 @@ worker_config = WorkerConfig(
         on_info=MODEL_INFO_LOG_MSGS
     )
 )
+
+# Remove optional placeholder when benchmark is enabled.
+worker_config.handlers = [handler for handler in worker_config.handlers if handler is not None]
 
 Worker(worker_config).run()
