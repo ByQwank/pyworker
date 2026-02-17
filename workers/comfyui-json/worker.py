@@ -43,6 +43,12 @@ DEFAULT_STEPS = 8
 # so callers can re-route to another worker.
 MAX_QUEUE_TIME = 0.0
 WORKLOAD_MULTIPLIER = 0.6
+ENABLE_BENCHMARK = os.getenv("PYWORKER_ENABLE_BENCHMARK", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora")
 HF_LORA_TOKEN = os.getenv("HF_TOKEN")
@@ -527,33 +533,51 @@ fallback_benchmark_prompts = [
     "Collage for textile; surreal cartoon cat in cap/jeans before poster; crisp.",
 ]
 
-custom_benchmark_workflow = load_custom_benchmark_workflow()
-if custom_benchmark_workflow:
-    benchmark_dataset = [
-        {
-            "input": {
-                "request_id": f"benchmark-{random.randint(1000, 99999)}",
-                "workflow_json": custom_benchmark_workflow,
+benchmark_dataset = []
+if ENABLE_BENCHMARK:
+    custom_benchmark_workflow = load_custom_benchmark_workflow()
+    if custom_benchmark_workflow:
+        benchmark_dataset = [
+            {
+                "input": {
+                    "request_id": f"benchmark-{random.randint(1000, 99999)}",
+                    "workflow_json": custom_benchmark_workflow,
+                }
             }
-        }
-    ]
+        ]
+    else:
+        benchmark_dataset = [
+            {
+                "input": {
+                    "request_id": f"benchmark-{random.randint(1000, 99999)}",
+                    "modifier": "Text2Image",
+                    "modifications": {
+                        "prompt": prompt,
+                        "width": 512,
+                        "height": 512,
+                        "steps": 20,
+                        "seed": random.randint(0, sys.maxsize),
+                    },
+                }
+            }
+            for prompt in fallback_benchmark_prompts
+        ]
+
+benchmark_config = (
+    BenchmarkConfig(
+        dataset=benchmark_dataset,
+        runs=1,
+        concurrency=1,
+        do_warmup=False,
+    )
+    if ENABLE_BENCHMARK
+    else None
+)
+
+if ENABLE_BENCHMARK:
+    log.info("Pyworker benchmark enabled (PYWORKER_ENABLE_BENCHMARK=true)")
 else:
-    benchmark_dataset = [
-        {
-            "input": {
-                "request_id": f"benchmark-{random.randint(1000, 99999)}",
-                "modifier": "Text2Image",
-                "modifications": {
-                    "prompt": prompt,
-                    "width": 512,
-                    "height": 512,
-                    "steps": 20,
-                    "seed": random.randint(0, sys.maxsize),
-                },
-            }
-        }
-        for prompt in fallback_benchmark_prompts
-    ]
+    log.info("Pyworker benchmark disabled (PYWORKER_ENABLE_BENCHMARK=false)")
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
@@ -567,12 +591,7 @@ worker_config = WorkerConfig(
             max_queue_time=MAX_QUEUE_TIME,
             request_parser=ensure_required_loras,
             workload_calculator=workload_calculator,
-            benchmark_config=BenchmarkConfig(
-                dataset=benchmark_dataset,
-                runs=1,
-                concurrency=1,
-                do_warmup=False,
-            )
+            benchmark_config=benchmark_config
         )
     ],
     log_action_config=LogActionConfig(
