@@ -12,6 +12,9 @@ INPUTS_DIR="${COMFYUI_DIR}/input"
 WORKFLOWS_DIR="${COMFYUI_DIR}/user/default/workflows"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-1}"
+HF_DOWNLOAD_PRIMARY="${HF_DOWNLOAD_PRIMARY:-hf}"
+HF_SHARED_CACHE_DIR="${HF_SHARED_CACHE_DIR:-${WORKSPACE_DIR}/.hf-cache}"
+HF_HF_TIMEOUT_SEC="${HF_HF_TIMEOUT_SEC:-3600}"
 HF_CURL_MAX_TIME_SEC="${HF_CURL_MAX_TIME_SEC:-5400}"
 HF_STALL_SPEED_LIMIT_BYTES="${HF_STALL_SPEED_LIMIT_BYTES:-131072}"
 HF_STALL_SPEED_TIME_SEC="${HF_STALL_SPEED_TIME_SEC:-180}"
@@ -167,6 +170,7 @@ download_hf_file() {
         local current_delay=$retry_delay
         local part_path="${output_path}.part"
         local curl_auth_header=()
+        local hf_cmd
         if [[ -n "${HF_TOKEN:-}" ]]; then
             curl_auth_header=(-H "Authorization: Bearer ${HF_TOKEN}")
         fi
@@ -179,53 +183,75 @@ download_hf_file() {
 
             log "Downloading $repo/$file_path (attempt $attempt/$max_retries, resume_from=${partial_before}B)..."
 
-            if curl -fL \
-                --retry 5 \
-                --retry-delay 3 \
-                --retry-all-errors \
-                --connect-timeout 30 \
-                --max-time "$HF_CURL_MAX_TIME_SEC" \
-                --speed-limit "$HF_STALL_SPEED_LIMIT_BYTES" \
-                --speed-time "$HF_STALL_SPEED_TIME_SEC" \
-                "${curl_auth_header[@]}" \
-                -C - \
-                -o "$part_path" \
-                "$url" 2>&1 | tee -a "$MODEL_LOG"; then
-                if [[ -s "$part_path" ]]; then
-                    mv "$part_path" "$output_path"
-                    local free_after
-                    free_after=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub("G","",$4); print $4}')
-                    if [[ -n "$free_after" ]]; then
-                        log "[HF] Post-download free disk: ${free_after}G for $output_path"
-                    fi
-                    release_slot "$slot"
-                    log "[OK] Downloaded: $output_path"
-                    exit 0
-                fi
-                log "Download reported success but file missing: $part_path"
-            fi
-
-            log "[WARN] curl download failed for $repo/$file_path; trying hf CLI fallback..."
             local temp_dir
             temp_dir=$(mktemp -d)
+            local downloaded=0
 
-            if hf download "$repo" "$file_path" --local-dir "$temp_dir" --cache-dir "$temp_dir/.cache" 2>&1 | tee -a "$MODEL_LOG"; then
-                if [ -f "$temp_dir/$file_path" ]; then
-                    mv "$temp_dir/$file_path" "$output_path"
-                    local free_after_fallback
-                    free_after_fallback=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub("G","",$4); print $4}')
-                    if [[ -n "$free_after_fallback" ]]; then
-                        log "[HF] Post-download free disk: ${free_after_fallback}G for $output_path"
-                    fi
-                    rm -rf "$temp_dir"
-                    rm -f "$part_path"
-                    release_slot "$slot"
-                    log "[OK] Downloaded via hf CLI fallback: $output_path"
-                    exit 0
+            # Primary path: HuggingFace CLI + shared cache.
+            # This keeps partials across retries/reboots and benefits from hf_transfer acceleration.
+            if [[ "$HF_DOWNLOAD_PRIMARY" == "hf" ]]; then
+                log "[HF] primary=hf cache=${HF_SHARED_CACHE_DIR}"
+                mkdir -p "$HF_SHARED_CACHE_DIR"
+
+                if command -v timeout >/dev/null 2>&1; then
+                    hf_cmd="timeout --foreground ${HF_HF_TIMEOUT_SEC} hf download \"$repo\" \"$file_path\" --local-dir \"$temp_dir\" --cache-dir \"$HF_SHARED_CACHE_DIR\""
+                else
+                    hf_cmd="hf download \"$repo\" \"$file_path\" --local-dir \"$temp_dir\" --cache-dir \"$HF_SHARED_CACHE_DIR\""
                 fi
-                log "hf CLI fallback reported success but file missing: $temp_dir/$file_path"
+
+                if eval "$hf_cmd" 2>&1 | tee -a "$MODEL_LOG"; then
+                    if [ -f "$temp_dir/$file_path" ]; then
+                        mv "$temp_dir/$file_path" "$output_path"
+                        local free_after
+                        free_after=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub("G","",$4); print $4}')
+                        if [[ -n "$free_after" ]]; then
+                            log "[HF] Post-download free disk: ${free_after}G for $output_path"
+                        fi
+                        rm -f "$part_path"
+                        downloaded=1
+                    else
+                        log "hf download reported success but file missing: $temp_dir/$file_path"
+                    fi
+                else
+                    log "[WARN] hf download failed for $repo/$file_path; trying curl resume fallback..."
+                fi
             fi
+
+            # Fallback path: curl resume to tolerate odd HF API/transient failures.
+            if [[ "$downloaded" -eq 0 ]]; then
+                if curl -fL \
+                    --retry 5 \
+                    --retry-delay 3 \
+                    --retry-all-errors \
+                    --connect-timeout 30 \
+                    --max-time "$HF_CURL_MAX_TIME_SEC" \
+                    --speed-limit "$HF_STALL_SPEED_LIMIT_BYTES" \
+                    --speed-time "$HF_STALL_SPEED_TIME_SEC" \
+                    "${curl_auth_header[@]}" \
+                    -C - \
+                    -o "$part_path" \
+                    "$url" 2>&1 | tee -a "$MODEL_LOG"; then
+                    if [[ -s "$part_path" ]]; then
+                        mv "$part_path" "$output_path"
+                        local free_after_fallback
+                        free_after_fallback=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub("G","",$4); print $4}')
+                        if [[ -n "$free_after_fallback" ]]; then
+                            log "[HF] Post-download free disk: ${free_after_fallback}G for $output_path"
+                        fi
+                        downloaded=1
+                    else
+                        log "curl reported success but file missing: $part_path"
+                    fi
+                fi
+            fi
+
             rm -rf "$temp_dir"
+
+            if [[ "$downloaded" -eq 1 ]]; then
+                release_slot "$slot"
+                log "[OK] Downloaded: $output_path"
+                exit 0
+            fi
 
             local partial_after=0
             if [[ -f "$part_path" ]]; then
@@ -854,6 +880,7 @@ main() {
 
     rm -rf "$HF_SEMAPHORE_DIR"
     mkdir -p "$HF_SEMAPHORE_DIR"
+    mkdir -p "$HF_SHARED_CACHE_DIR"
     mkdir -p "$WORKFLOWS_DIR" "$INPUTS_DIR"
     mkdir -p "$MODELS_DIR"/{checkpoints,text_encoders,diffusion_models,vae,loras}
     mkdir -p "${COMFYUI_DIR}/custom_nodes"
@@ -869,7 +896,7 @@ main() {
     fi
 
     set_cleanup_job
-    log "Phase 2: Starting model downloads (HF_MAX_PARALLEL=${HF_MAX_PARALLEL})..."
+    log "Phase 2: Starting model downloads (HF_MAX_PARALLEL=${HF_MAX_PARALLEL}, primary=${HF_DOWNLOAD_PRIMARY})..."
     local pids=()
     local model url output_path
     for model in "${HF_MODELS[@]}"; do
