@@ -20,16 +20,20 @@ GIT_MAX_PARALLEL="${GIT_MAX_PARALLEL:-5}"
 AUTO_UPDATE_NODES="${AUTO_UPDATE_NODES:-true}"
 PRELOAD_ALL_LORAS="${PRELOAD_ALL_LORAS:-false}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-${WORKSPACE_DIR}/.hf-cache}"
+HF_DOWNLOAD_BACKEND="${HF_DOWNLOAD_BACKEND:-aria2}" # aria2|hf|curl
+ARIA2_CONNECTIONS="${ARIA2_CONNECTIONS:-16}"
+ARIA2_MIN_SPLIT_SIZE="${ARIA2_MIN_SPLIT_SIZE:-10M}"
 
 APT_PACKAGES=(
   git
   rsync
   curl
   wget
+  aria2
 )
 
 PIP_PACKAGES=(
-  "huggingface_hub[hf_transfer]"
+  huggingface_hub
   hf_transfer
   lark
   sentencepiece
@@ -57,7 +61,6 @@ HF_MODELS=(
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors|${MODELS_DIR}/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors|${MODELS_DIR}/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
   "https://huggingface.co/hfmaster/models-moved/resolve/cab6dcee2fbb05e190dbb8f536fbdaa489031a14/rife/rife49.pth|${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/models/rife/rife49.pth"
-  "https://huggingface.co/hfmaster/models-moved/resolve/cab6dcee2fbb05e190dbb8f536fbdaa489031a14/rife/rife49.pth|${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife49.pth"
   "https://huggingface.co/Dylaaann/Lora/resolve/main/high_4step.safetensors|${LORA_DIR}/high_4step.safetensors"
   "https://huggingface.co/Dylaaann/Lora/resolve/main/low_4step.safetensors|${LORA_DIR}/low_4step.safetensors"
 )
@@ -185,21 +188,55 @@ parse_hf_url() {
 download_with_resume() {
   local url="$1"
   local out="$2"
+  local out_dir out_file
+  out_dir="$(dirname "$out")"
+  out_file="$(basename "$out")"
   local part="${out}.part"
   local header=()
   if [[ -n "${HF_TOKEN:-}" && "$url" =~ ^https://huggingface\.co/ ]]; then
-    header=(-H "Authorization: Bearer ${HF_TOKEN}")
+    header=("Authorization: Bearer ${HF_TOKEN}")
   fi
 
-  retry_cmd 5 curl -fL \
-    --retry 5 \
-    --retry-delay 3 \
-    --retry-all-errors \
-    --connect-timeout 30 \
-    -C - \
-    "${header[@]}" \
-    -o "$part" \
-    "$url" >/dev/null
+  if [[ "$HF_DOWNLOAD_BACKEND" == "aria2" ]] && command -v aria2c >/dev/null 2>&1; then
+    local aria2_headers=()
+    local h
+    for h in "${header[@]}"; do
+      aria2_headers+=(--header="$h")
+    done
+
+    retry_cmd 5 aria2c \
+      --console-log-level=warn \
+      --summary-interval=0 \
+      --allow-overwrite=true \
+      --auto-file-renaming=false \
+      --continue=true \
+      --file-allocation=none \
+      --max-connection-per-server="$ARIA2_CONNECTIONS" \
+      --split="$ARIA2_CONNECTIONS" \
+      --min-split-size="$ARIA2_MIN_SPLIT_SIZE" \
+      --timeout=60 \
+      --max-tries=5 \
+      --retry-wait=3 \
+      "${aria2_headers[@]}" \
+      --dir "$out_dir" \
+      --out "${out_file}.part" \
+      "$url" >/dev/null
+  else
+    local curl_headers=()
+    local c
+    for c in "${header[@]}"; do
+      curl_headers+=(-H "$c")
+    done
+    retry_cmd 5 curl -fL \
+      --retry 5 \
+      --retry-delay 3 \
+      --retry-all-errors \
+      --connect-timeout 30 \
+      -C - \
+      "${curl_headers[@]}" \
+      -o "$part" \
+      "$url" >/dev/null
+  fi
 
   mv "$part" "$out"
 }
@@ -217,7 +254,7 @@ download_model_spec() {
     return 0
   fi
 
-  if [[ "$url" =~ ^https://huggingface\.co/ ]] && command -v hf >/dev/null 2>&1; then
+  if [[ "$HF_DOWNLOAD_BACKEND" == "hf" && "$url" =~ ^https://huggingface\.co/ ]] && command -v hf >/dev/null 2>&1; then
     local parsed repo file_path tmpdir
     if parsed="$(parse_hf_url "$url")"; then
       repo="${parsed%%|*}"
@@ -240,8 +277,18 @@ download_model_spec() {
   log "[OK] Downloaded: $out"
 }
 
+seed_rife_ckpt_path() {
+  local src="${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/models/rife/rife49.pth"
+  local dst="${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife49.pth"
+  if [[ -f "$src" && ! -f "$dst" ]]; then
+    mkdir -p "$(dirname "$dst")"
+    cp -f "$src" "$dst"
+    log "[OK] Seeded RIFE ckpt path from downloaded model file"
+  fi
+}
+
 download_models_parallel() {
-  log "Starting model downloads (HF_MAX_PARALLEL=${HF_MAX_PARALLEL})..."
+  log "Starting model downloads (HF_MAX_PARALLEL=${HF_MAX_PARALLEL}, backend=${HF_DOWNLOAD_BACKEND}, aria2_conns=${ARIA2_CONNECTIONS})..."
   local running=0
   local failed=0
   local spec
@@ -326,6 +373,7 @@ provisioning_start() {
 
   clone_nodes_parallel
   download_models_parallel
+  seed_rife_ckpt_path
   download_all_loras_if_enabled
 
   # Keep requirements/installers after clone + base downloads for better startup reliability.
