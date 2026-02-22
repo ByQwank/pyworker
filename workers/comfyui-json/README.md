@@ -100,55 +100,17 @@ Images will be saved locally AND uploaded to `s3://{bucket}/comfyui/{filename}`.
 
 **Note:** Requires `boto3` (`pip install boto3`).
 
-## Benchmarking
+## Benchmark behavior
 
-### Custom Benchmark Workflows
+This fork disables heavy workflow benchmarking for direct-instance mode.
 
-You can provide a custom ComfyUI workflow for benchmarking by creating `workers/comfyui-json/misc/benchmark.json`. This allows you to benchmark with your real workflow shape (for example Wan 2.2 I2V) instead of SD1.5 text-to-image.
+- `workers/comfyui-json/misc/benchmark.json` is not used.
+- `/generate/sync` does not run workload benchmark datasets.
+- A lightweight internal `/benchmark/ping` bootstrap benchmark remains enabled by default only for pyworker startup compatibility.
 
-**Ways to provide the benchmark file:**
-- Keep the default `workers/comfyui-json/misc/benchmark.json` from this repo
-- Fork this repository and replace `benchmark.json` with your own workflow
-- Write/overwrite the file during worker provisioning (onstart script or setup phase)
+Optional env:
 
-Use the placeholder `__RANDOM_INT__` for seed-like values. The worker replaces it with a random integer when loading the benchmark workflow.
-
-### Default Benchmark (Fallback)
-
-If `benchmark.json` is not available, the worker falls back to a simple SD1.5 text-to-image benchmark when each worker initializes. This validates GPU performance and helps identify underperforming machines.
-
-The default benchmark uses Stable Diffusion v1.5 with ComfyUI's standard text-to-image workflow. Configure it using these environment variables:
-
-| Environment Variable | Default Value | Description |
-| -------------------- | ------------- | ----------- |
-| BENCHMARK_TEST_WIDTH | 512 | Image width (pixels) |
-| BENCHMARK_TEST_HEIGHT | 512 | Image height (pixels) |
-| BENCHMARK_TEST_STEPS | 20 | Number of denoising steps |
-
-Each benchmark run uses a random prompt from `misc/test_prompts.txt` and a random seed to ensure consistent GPU load patterns.
-
-#### Calibrating Fallback Benchmark Duration
-
-To screen for underperforming hardware, set `BENCHMARK_TEST_STEPS` to match your expected production workflow duration. This allows you to identify machines that won't meet performance requirements.
-
-**Example:** If your typical workflow should complete in 90 seconds on acceptable hardware:
-
-```bash
-# 1. Measure it/sec on your reference machine
-# RTX 4090 typically achieves ~43 it/sec with SD1.5
-
-# 2. Calculate required steps
-# 90 seconds × 43 it/sec = 3870 steps
-
-# 3. Configure benchmark
-export BENCHMARK_TEST_STEPS=3870
-
-# 4. Machines completing significantly slower than 90s indicate hardware issues
-```
-
-**Performance expectations:**
-- Benchmark duration should remain consistent across identical GPU models
-- Significant variation (>20%) may indicate thermal, power, or configuration issues
+- `PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK=true|false` (default `true`)
 
 ## Endpoint
 

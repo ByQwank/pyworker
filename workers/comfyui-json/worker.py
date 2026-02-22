@@ -1,4 +1,3 @@
-import base64
 import fcntl
 import hashlib
 import hmac
@@ -6,9 +5,7 @@ import json
 import logging
 import math
 import os
-import random
 import re
-import sys
 import time
 
 from pathlib import Path
@@ -43,7 +40,7 @@ DEFAULT_STEPS = 8
 # so callers can re-route to another worker.
 MAX_QUEUE_TIME = 0.0
 WORKLOAD_MULTIPLIER = 0.6
-ENABLE_BENCHMARK = os.getenv("PYWORKER_ENABLE_BENCHMARK", "false").lower() in {
+ENABLE_BOOTSTRAP_BENCHMARK = os.getenv("PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK", "true").lower() in {
     "1",
     "true",
     "yes",
@@ -53,14 +50,23 @@ ENABLE_BENCHMARK = os.getenv("PYWORKER_ENABLE_BENCHMARK", "false").lower() in {
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora")
 HF_LORA_TOKEN = os.getenv("HF_TOKEN")
 COMFY_LORA_DIR = Path(os.getenv("COMFY_LORA_DIR", "/workspace/ComfyUI/models/loras"))
-COMFY_INPUT_DIR = Path(os.getenv("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 MANIFEST_SECRET = os.getenv("PYWORKER_MANIFEST_SECRET", "").strip()
 MANIFEST_MAX_AGE_SECONDS = int(os.getenv("PYWORKER_MANIFEST_MAX_AGE_SECONDS", "900"))
-REQUIRE_SIGNED_MANIFEST = os.getenv("PYWORKER_REQUIRE_MANIFEST", "false").lower() == "true"
-BENCHMARK_WORKFLOW_PATH = Path(os.path.join(os.path.dirname(__file__), "misc", "benchmark.json"))
-BENCHMARK_IMAGE_NAME = "benchmark.png"
-RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
-INVALID_BENCHMARK_IMAGE_VALUES = {"", "undefined", "none", "null"}
+MANIFEST_ENDPOINT = os.getenv("PYWORKER_MANIFEST_ENDPOINT", "direct-instance").strip()
+
+_require_manifest_raw = os.getenv("PYWORKER_REQUIRE_MANIFEST", "auto").strip().lower()
+if _require_manifest_raw in {"1", "true", "yes", "on"}:
+    REQUIRE_SIGNED_MANIFEST = True
+elif _require_manifest_raw in {"0", "false", "no", "off"}:
+    REQUIRE_SIGNED_MANIFEST = False
+else:
+    # Auto: require signed manifests whenever a verification secret is configured.
+    REQUIRE_SIGNED_MANIFEST = bool(MANIFEST_SECRET)
+
+if REQUIRE_SIGNED_MANIFEST and not MANIFEST_SECRET:
+    raise RuntimeError(
+        "PYWORKER_REQUIRE_MANIFEST is enabled but PYWORKER_MANIFEST_SECRET is not configured."
+    )
 
 IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
@@ -136,6 +142,10 @@ def parse_and_verify_manifest(manifest: dict[str, Any]) -> list[str]:
         raise ValueError("lora_manifest.generationId must be a non-empty string.")
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError("lora_manifest.endpoint must be a non-empty string.")
+    if MANIFEST_ENDPOINT and endpoint != MANIFEST_ENDPOINT:
+        raise ValueError(
+            f"lora_manifest.endpoint mismatch. expected='{MANIFEST_ENDPOINT}' got='{endpoint}'"
+        )
     if not isinstance(issued_at, (int, float)):
         raise ValueError("lora_manifest.issuedAt must be a number.")
     if not isinstance(signature, str) or not signature:
@@ -203,102 +213,6 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
     return target_path
 
 
-def ensure_benchmark_image_present() -> None:
-    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    target_path = COMFY_INPUT_DIR / BENCHMARK_IMAGE_NAME
-    if target_path.exists():
-        return
-
-    # 1x1 transparent PNG
-    png_b64 = (
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B3SIAAAAASUVORK5CYII="
-    )
-    try:
-        target_path.write_bytes(base64.b64decode(png_b64))
-        log.info("Created benchmark image at %s", target_path)
-    except Exception as exc:
-        log.warning("Failed to write benchmark image: %s", exc)
-
-
-def materialize_random_placeholders(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: materialize_random_placeholders(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [materialize_random_placeholders(item) for item in value]
-    if isinstance(value, str) and value.strip() == RANDOM_INT_PLACEHOLDER:
-        return random.randint(0, sys.maxsize)
-    return value
-
-
-def workflow_references_benchmark_image(workflow_json: dict[str, Any]) -> bool:
-    for node in workflow_json.values():
-        if not isinstance(node, dict):
-            continue
-        if node.get("class_type") != "LoadImage":
-            continue
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
-        image_name = inputs.get("image")
-        if isinstance(image_name, str) and image_name.strip() == BENCHMARK_IMAGE_NAME:
-            return True
-    return False
-
-
-def normalize_benchmark_load_images(workflow_json: dict[str, Any]) -> int:
-    patched = 0
-    for node in workflow_json.values():
-        if not isinstance(node, dict):
-            continue
-        if node.get("class_type") != "LoadImage":
-            continue
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
-        image_name = inputs.get("image")
-        if not isinstance(image_name, str):
-            continue
-        if image_name.strip().lower() in INVALID_BENCHMARK_IMAGE_VALUES:
-            inputs["image"] = BENCHMARK_IMAGE_NAME
-            patched += 1
-    return patched
-
-
-def load_custom_benchmark_workflow() -> dict[str, Any] | None:
-    if not BENCHMARK_WORKFLOW_PATH.exists():
-        return None
-
-    try:
-        with BENCHMARK_WORKFLOW_PATH.open("r", encoding="utf-8") as file:
-            parsed = json.load(file)
-    except Exception as exc:
-        log.warning("Failed to load benchmark workflow from %s: %s", BENCHMARK_WORKFLOW_PATH, exc)
-        return None
-
-    if not isinstance(parsed, dict):
-        log.warning("Benchmark workflow in %s must be a JSON object", BENCHMARK_WORKFLOW_PATH)
-        return None
-
-    workflow_json = materialize_random_placeholders(parsed)
-    if not isinstance(workflow_json, dict):
-        log.warning("Benchmark workflow in %s resolved to an invalid value", BENCHMARK_WORKFLOW_PATH)
-        return None
-
-    patched_count = normalize_benchmark_load_images(workflow_json)
-    if patched_count > 0:
-        log.warning(
-            "Patched %d LoadImage nodes in benchmark workflow to use '%s'",
-            patched_count,
-            BENCHMARK_IMAGE_NAME,
-        )
-
-    if patched_count > 0 or workflow_references_benchmark_image(workflow_json):
-        ensure_benchmark_image_present()
-
-    log.info("Loaded custom benchmark workflow from %s", BENCHMARK_WORKFLOW_PATH)
-    return workflow_json
-
-
 def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be an object.")
@@ -310,11 +224,6 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     workflow_json = input_payload.get("workflow_json")
     if not isinstance(workflow_json, dict):
         # Allow modifier-mode requests that do not send a workflow_json payload.
-        return payload
-
-    request_id = input_payload.get("request_id")
-    if isinstance(request_id, str) and request_id.startswith("benchmark-"):
-        # Benchmark requests should not depend on runtime LoRA fetches.
         return payload
 
     requested_loras_raw = input_payload.get("required_loras")
@@ -522,91 +431,42 @@ def workload_calculator(payload):
     return estimate_workload(workflow)
 
 
-fallback_benchmark_prompts = [
-    "Cartoon hoodie hero; orc, anime cat, bunny; black goo; buff; vector on white.",
-    "Cozy farming-game scene with fine details.",
-    "2D vector child with soccer ball; airbrush chrome; swagger; antique copper.",
-    "Realistic futuristic downtown of low buildings at sunset.",
-    "Perfect wave front view; sunny seascape; ultra-detailed water; artful feel.",
-    "Clear cup with ice, fruit, mint; creamy swirls; fluid-sim CGI; warm glow.",
-    "Male biker with backpack on motorcycle; oilpunk; award-worthy magazine cover.",
-    "Collage for textile; surreal cartoon cat in cap/jeans before poster; crisp.",
-]
-
-benchmark_dataset = []
-if ENABLE_BENCHMARK:
-    custom_benchmark_workflow = load_custom_benchmark_workflow()
-    if custom_benchmark_workflow:
-        benchmark_dataset = [
-            {
-                "input": {
-                    "request_id": f"benchmark-{random.randint(1000, 99999)}",
-                    "workflow_json": custom_benchmark_workflow,
-                }
-            }
-        ]
-    else:
-        benchmark_dataset = [
-            {
-                "input": {
-                    "request_id": f"benchmark-{random.randint(1000, 99999)}",
-                    "modifier": "Text2Image",
-                    "modifications": {
-                        "prompt": prompt,
-                        "width": 512,
-                        "height": 512,
-                        "steps": 20,
-                        "seed": random.randint(0, sys.maxsize),
-                    },
-                }
-            }
-            for prompt in fallback_benchmark_prompts
-        ]
-
-benchmark_config = (
-    BenchmarkConfig(
-        dataset=benchmark_dataset,
-        runs=1,
-        concurrency=1,
-        do_warmup=False,
+if ENABLE_BOOTSTRAP_BENCHMARK:
+    log.info(
+        "Pyworker heavy benchmark is disabled. "
+        "Using lightweight bootstrap ping benchmark only."
     )
-    if ENABLE_BENCHMARK
-    else None
-)
-
-if ENABLE_BENCHMARK:
-    log.info("Pyworker benchmark enabled (PYWORKER_ENABLE_BENCHMARK=true)")
 else:
     log.info(
-        "Pyworker benchmark workflow disabled (PYWORKER_ENABLE_BENCHMARK=false), "
-        "using lightweight internal benchmark route"
+        "Pyworker heavy benchmark is disabled and bootstrap ping benchmark is also disabled."
     )
 
 
-def benchmark_ping_generator() -> dict[str, Any]:
-    # Lightweight synthetic payload used only to satisfy pyworker startup benchmark
-    # in direct-instance mode where serverless autoscaling perf is not used.
+def bootstrap_ping_generator() -> dict[str, Any]:
+    # Lightweight synthetic payload used only to satisfy pyworker startup benchmark.
     return {"ping": True, "ts": time.time()}
 
 
-async def benchmark_ping_remote(**params):
+async def bootstrap_ping_remote(**params):
     return {"ok": True, "params": params}
 
 
-benchmark_handler_config = HandlerConfig(
-    route="/benchmark/ping",
-    allow_parallel_requests=True,
-    max_queue_time=MAX_QUEUE_TIME,
-    benchmark_config=BenchmarkConfig(
-        generator=benchmark_ping_generator,
-        runs=1,
-        concurrency=1,
-        do_warmup=False,
-    ),
-    remote_function=benchmark_ping_remote,
+bootstrap_handler_config = (
+    HandlerConfig(
+        route="/benchmark/ping",
+        allow_parallel_requests=True,
+        max_queue_time=MAX_QUEUE_TIME,
+        benchmark_config=BenchmarkConfig(
+            generator=bootstrap_ping_generator,
+            runs=1,
+            concurrency=1,
+            do_warmup=False,
+        ),
+        remote_function=bootstrap_ping_remote,
+    )
+    if ENABLE_BOOTSTRAP_BENCHMARK
+    else None
 )
-
-generate_handler_benchmark_config = benchmark_config if ENABLE_BENCHMARK else None
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
@@ -614,14 +474,14 @@ worker_config = WorkerConfig(
     model_log_file=MODEL_LOG_FILE,
     model_healthcheck_url=MODEL_HEALTHCHECK_ENDPOINT,
     handlers=[
-        benchmark_handler_config if not ENABLE_BENCHMARK else None,
+        bootstrap_handler_config,
         HandlerConfig(
             route="/generate/sync",
             allow_parallel_requests=False,
             max_queue_time=MAX_QUEUE_TIME,
             request_parser=ensure_required_loras,
             workload_calculator=workload_calculator,
-            benchmark_config=generate_handler_benchmark_config,
+            benchmark_config=None,
         ),
     ],
     log_action_config=LogActionConfig(

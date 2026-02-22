@@ -5,7 +5,6 @@ This fork is intentionally minimal and only keeps the `comfyui-json` backend use
 ## What this fork contains
 
 - `workers/comfyui-json/worker.py` - primary PyWorker backend
-- `workers/comfyui-json/misc/benchmark.json` - benchmark workflow used by the backend
 - `start_server.sh` - startup bootstrap script used by Vast templates
 - `provisioning/Provision1.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
 
@@ -24,12 +23,15 @@ To reduce maintenance and confusion, unused template workers were removed from t
 - `PYWORKER_REPO=https://github.com/ByQwank/pyworker`
 - `PROVISIONING_SCRIPT=<raw url to provisioning/Provision1.sh>`
 - `HF_TOKEN=<huggingface token>`
+- `PYWORKER_MANIFEST_SECRET=<shared HMAC secret for LoRA manifests>`
 
 Optional:
 
 - `PYWORKER_REF=<branch|tag|commit>`
 - `SDK_BRANCH=<vast-sdk branch|tag|commit>`
 - `SDK_VERSION=<vastai-sdk version>`
+- `PYWORKER_REQUIRE_MANIFEST=auto|true|false` (default `auto`, requires signed manifests when secret is set)
+- `PYWORKER_MANIFEST_ENDPOINT=direct-instance` (must match Trigger manifest endpoint)
 
 ## Provision script raw URL
 
