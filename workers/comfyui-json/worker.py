@@ -17,7 +17,9 @@ from huggingface_hub import hf_hub_download
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
 # ComyUI model configuration
-MODEL_SERVER_BASE_URL = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:18288").strip().rstrip("/")
+# Pyworker's ComfyUI transport posts directly to raw ComfyUI endpoints like /prompt,
+# so this base URL must target the actual ComfyUI server, not an external wrapper.
+MODEL_SERVER_BASE_URL = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:18188").strip().rstrip("/")
 MODEL_HEALTHCHECK_BASE_URL = (
     os.getenv("COMFYUI_HEALTHCHECK_BASE", "http://127.0.0.1:18188").strip().rstrip("/")
     or MODEL_SERVER_BASE_URL
