@@ -18,6 +18,10 @@ from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, Benchma
 
 # ComyUI model configuration
 MODEL_SERVER_BASE_URL = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:18288").strip().rstrip("/")
+MODEL_HEALTHCHECK_BASE_URL = (
+    os.getenv("COMFYUI_HEALTHCHECK_BASE", "http://127.0.0.1:18188").strip().rstrip("/")
+    or MODEL_SERVER_BASE_URL
+)
 _MODEL_SERVER_PARSED = urlparse(MODEL_SERVER_BASE_URL)
 MODEL_SERVER_SCHEME = _MODEL_SERVER_PARSED.scheme or "http"
 MODEL_SERVER_HOST = _MODEL_SERVER_PARSED.hostname or "127.0.0.1"
@@ -470,7 +474,7 @@ async def readyz_remote(**params):
     if not PROVISIONING_DONE_MARKER.exists():
         raise RuntimeError(f"Provisioning not complete: {PROVISIONING_DONE_MARKER}")
 
-    health_url = f"{MODEL_SERVER_URL}:{MODEL_SERVER_PORT}{MODEL_HEALTHCHECK_ENDPOINT}"
+    health_url = f"{MODEL_HEALTHCHECK_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
     timeout = aiohttp.ClientTimeout(total=10)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
