@@ -7,7 +7,9 @@ import math
 import os
 import re
 import time
+from urllib.parse import urlparse
 
+import aiohttp
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +17,21 @@ from huggingface_hub import hf_hub_download
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
 # ComyUI model configuration
-MODEL_SERVER_URL = "http://127.0.0.1"
-MODEL_SERVER_PORT = 18288
+MODEL_SERVER_BASE_URL = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:18288").strip().rstrip("/")
+_MODEL_SERVER_PARSED = urlparse(MODEL_SERVER_BASE_URL)
+MODEL_SERVER_SCHEME = _MODEL_SERVER_PARSED.scheme or "http"
+MODEL_SERVER_HOST = _MODEL_SERVER_PARSED.hostname or "127.0.0.1"
+MODEL_SERVER_PORT = _MODEL_SERVER_PARSED.port or (443 if MODEL_SERVER_SCHEME == "https" else 80)
+MODEL_SERVER_URL = f"{MODEL_SERVER_SCHEME}://{MODEL_SERVER_HOST}"
 MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
-MODEL_HEALTHCHECK_ENDPOINT = "/health"
+MODEL_HEALTHCHECK_ENDPOINT = os.getenv("COMFYUI_HEALTHCHECK_ENDPOINT", "/system_stats").strip() or "/system_stats"
+READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
+PROVISIONING_DONE_MARKER = Path(
+    os.getenv("PROVISIONING_DONE_MARKER", "/workspace/.provisioning-complete")
+)
+PROVISIONING_FAILED_MARKER = Path(
+    os.getenv("PROVISIONING_FAILED_MARKER", "/workspace/.provisioning-failed")
+)
 
 # ComyUI-specific log messages
 MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
@@ -451,6 +464,31 @@ async def bootstrap_ping_remote(**params):
     return {"ok": True, "params": params}
 
 
+async def readyz_remote(**params):
+    if PROVISIONING_FAILED_MARKER.exists():
+        raise RuntimeError(f"Provisioning failed: {PROVISIONING_FAILED_MARKER}")
+    if not PROVISIONING_DONE_MARKER.exists():
+        raise RuntimeError(f"Provisioning not complete: {PROVISIONING_DONE_MARKER}")
+
+    health_url = f"{MODEL_SERVER_URL}:{MODEL_SERVER_PORT}{MODEL_HEALTHCHECK_ENDPOINT}"
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(health_url) as response:
+            body = await response.text()
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Model healthcheck failed status={response.status} url={health_url} body={body[:500]}"
+                )
+
+    return {
+        "ok": True,
+        "healthcheck_url": health_url,
+        "model_server_base_url": MODEL_SERVER_BASE_URL,
+        "params": params,
+    }
+
+
 bootstrap_handler_config = (
     HandlerConfig(
         route="/benchmark/ping",
@@ -475,6 +513,13 @@ worker_config = WorkerConfig(
     model_healthcheck_url=MODEL_HEALTHCHECK_ENDPOINT,
     handlers=[
         bootstrap_handler_config,
+        HandlerConfig(
+            route=READY_ROUTE,
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=None,
+            remote_function=readyz_remote,
+        ),
         HandlerConfig(
             route="/generate/sync",
             allow_parallel_requests=False,
