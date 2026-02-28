@@ -37,7 +37,7 @@ PIP_PACKAGES=(
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/city96/ComfyUI-GGUF"
-    "https://github.com/kijai/ComfyUI-WanVideo"
+    "https://github.com/kijai/ComfyUI-WanVideoWrapper"
     "https://github.com/yolain/ComfyUI-Easy-Use"
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/kijai/ComfyUI-KJNodes"
@@ -400,7 +400,7 @@ function provisioning_verify() {
     done
 
     # Verify critical custom nodes
-    local critical_nodes=("ComfyUI-Easy-Use" "ComfyUI-WanVideo" "ComfyUI-KJNodes" "ComfyUI-VideoHelperSuite" "ComfyUI-Frame-Interpolation")
+    local critical_nodes=("ComfyUI-Easy-Use" "ComfyUI-WanVideoWrapper" "ComfyUI-KJNodes" "ComfyUI-VideoHelperSuite" "ComfyUI-Frame-Interpolation")
     for node in "${critical_nodes[@]}"; do
         if [[ -d "${COMFYUI_DIR}/custom_nodes/${node}" ]]; then
             log "✓ Node: ${node}"
