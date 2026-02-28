@@ -8,6 +8,10 @@ SERVER_DIR="$WORKSPACE_DIR/vast-pyworker"
 ENV_PATH="$WORKSPACE_DIR/worker-env"
 DEBUG_LOG="$WORKSPACE_DIR/debug.log"
 PYWORKER_LOG="$WORKSPACE_DIR/pyworker.log"
+PROVISIONING_DONE_MARKER="${PROVISIONING_DONE_MARKER:-$WORKSPACE_DIR/.provisioning-complete}"
+PROVISIONING_FAILED_MARKER="${PROVISIONING_FAILED_MARKER:-$WORKSPACE_DIR/.provisioning-failed}"
+PROVISIONING_WAIT_TIMEOUT_SECONDS="${PROVISIONING_WAIT_TIMEOUT_SECONDS:-2700}"
+PROVISIONING_WAIT_INTERVAL_SECONDS="${PROVISIONING_WAIT_INTERVAL_SECONDS:-5}"
 
 REPORT_ADDR="${REPORT_ADDR:-https://run.vast.ai}"
 USE_SSL="${USE_SSL:-true}"
@@ -19,6 +23,48 @@ exec &> >(tee -a "$DEBUG_LOG")
 
 function echo_var(){
     echo "$1: ${!1}"
+}
+
+function wait_for_provisioning_completion(){
+    local wait_mode="${WAIT_FOR_PROVISIONING_MARKER:-auto}"
+    local now
+    local deadline
+
+    if [ "$wait_mode" = "false" ]; then
+        echo "Skipping provisioning wait because WAIT_FOR_PROVISIONING_MARKER=false"
+        return 0
+    fi
+
+    if [ "$wait_mode" = "auto" ] && [ -f "/.noprovisioning" ]; then
+        echo "Skipping provisioning wait because /.noprovisioning is present"
+        return 0
+    fi
+
+    if [ "$wait_mode" = "auto" ] && [ -z "${PROVISIONING_SCRIPT:-}" ]; then
+        echo "Skipping provisioning wait because PROVISIONING_SCRIPT is not set"
+        return 0
+    fi
+
+    deadline=$(( $(date +%s) + PROVISIONING_WAIT_TIMEOUT_SECONDS ))
+    echo "Waiting for provisioning marker: $PROVISIONING_DONE_MARKER"
+
+    while true; do
+        if [ -f "$PROVISIONING_DONE_MARKER" ]; then
+            echo "Provisioning marker found"
+            return 0
+        fi
+
+        if [ -f "$PROVISIONING_FAILED_MARKER" ]; then
+            report_error_and_exit "Provisioning failed before pyworker startup"
+        fi
+
+        now=$(date +%s)
+        if [ "$now" -ge "$deadline" ]; then
+            report_error_and_exit "Timed out waiting for provisioning marker: $PROVISIONING_DONE_MARKER"
+        fi
+
+        sleep "$PROVISIONING_WAIT_INTERVAL_SECONDS"
+    done
 }
 
 function report_error_and_exit(){
@@ -89,6 +135,8 @@ echo_var ENV_PATH
 echo_var DEBUG_LOG
 echo_var PYWORKER_LOG
 echo_var MODEL_LOG
+echo_var PROVISIONING_DONE_MARKER
+echo_var PROVISIONING_FAILED_MARKER
 
 ROTATE_MODEL_LOG="${ROTATE_MODEL_LOG:-false}"
 if [ "$ROTATE_MODEL_LOG" = "true" ] && [ -e "$MODEL_LOG" ]; then
@@ -217,6 +265,8 @@ export REPORT_ADDR WORKER_PORT USE_SSL UNSECURED
 if ! cd "$SERVER_DIR"; then
     report_error_and_exit "Failed to cd into SERVER_DIR: $SERVER_DIR"
 fi
+
+wait_for_provisioning_completion
 
 echo "launching PyWorker server"
 

@@ -2,11 +2,16 @@
 # Custom Wan 2.2 I2V Provisioning for vast.ai
 # Parallel downloads via aria2c + hf_transfer for maximum bandwidth utilization
 
+set -e -o pipefail
+
 source /venv/main/bin/activate
-COMFYUI_DIR=${WORKSPACE}/ComfyUI
+WORKSPACE_ROOT="${WORKSPACE:-/workspace}"
+COMFYUI_DIR="${WORKSPACE_ROOT}/ComfyUI"
 MODELS_DIR="${COMFYUI_DIR}/models"
 LORA_PATH="${MODELS_DIR}/loras"
 MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
+PROVISIONING_DONE_MARKER="${PROVISIONING_DONE_MARKER:-${WORKSPACE_ROOT}/.provisioning-complete}"
+PROVISIONING_FAILED_MARKER="${PROVISIONING_FAILED_MARKER:-${WORKSPACE_ROOT}/.provisioning-failed}"
 
 APT_PACKAGES=(
     "aria2"
@@ -89,6 +94,7 @@ log() {
 
 function provisioning_start() {
     provisioning_print_header
+    rm -f "$PROVISIONING_DONE_MARKER" "$PROVISIONING_FAILED_MARKER"
 
     # Phase 1: System deps + pip (sequential, fast)
     provisioning_get_apt_packages
@@ -114,21 +120,79 @@ function provisioning_start() {
     # Phase 5: Verify critical files
     provisioning_verify
 
+    touch "$PROVISIONING_DONE_MARKER"
     provisioning_print_end
 }
 
 function provisioning_get_apt_packages() {
-    if [[ -n $APT_PACKAGES ]]; then
-        log "Installing APT packages..."
-        sudo $APT_INSTALL ${APT_PACKAGES[@]}
+    if ((${#APT_PACKAGES[@]} > 0)); then
+        local sudo_prefix=()
+
+        if [[ $(id -u) -ne 0 ]]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+                log "[ERROR] sudo is required to install APT packages"
+                return 1
+            fi
+            sudo_prefix=(sudo)
+        fi
+
+        log "Installing APT packages: ${APT_PACKAGES[*]}"
+        "${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update
+        "${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+
+        if ! command -v aria2c >/dev/null 2>&1; then
+            log "[ERROR] aria2c is still unavailable after APT install"
+            return 1
+        fi
     fi
 }
 
 function provisioning_get_pip_packages() {
-    if [[ -n $PIP_PACKAGES ]]; then
+    if ((${#PIP_PACKAGES[@]} > 0)); then
         log "Installing PIP packages..."
-        pip install --no-cache-dir ${PIP_PACKAGES[@]}
+        pip install --no-cache-dir "${PIP_PACKAGES[@]}"
     fi
+}
+
+function clone_or_update_repo() {
+    local repo="$1"
+    local path="$2"
+    local attempt
+
+    if [[ -d "$path/.git" ]]; then
+        if [[ ${AUTO_UPDATE,,} == "false" ]]; then
+            return 0
+        fi
+
+        for attempt in 1 2 3; do
+            if (
+                cd "$path" &&
+                git pull --ff-only >/dev/null 2>&1 &&
+                git submodule update --init --recursive >/dev/null 2>&1
+            ); then
+                return 0
+            fi
+            sleep $((attempt * 2))
+        done
+        return 1
+    fi
+
+    rm -rf "$path"
+    for attempt in 1 2 3; do
+        if git clone --depth 1 --single-branch --recursive --jobs 8 "$repo" "$path" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        rm -rf "$path"
+        if git clone --recursive --jobs 8 "$repo" "$path" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        rm -rf "$path"
+        sleep $((attempt * 2))
+    done
+
+    return 1
 }
 
 # Clone all custom nodes in parallel (much faster than sequential)
@@ -140,13 +204,9 @@ function provisioning_get_nodes_parallel() {
         dir="${repo##*/}"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         (
-            if [[ -d $path ]]; then
-                if [[ ${AUTO_UPDATE,,} != "false" ]]; then
-                    cd "$path" && git pull --depth 1 >/dev/null 2>&1
-                fi
-            else
-                git clone --depth 1 --single-branch "${repo}" "${path}" --recursive 2>/dev/null || \
-                git clone "${repo}" "${path}" --recursive 2>/dev/null
+            if ! clone_or_update_repo "$repo" "$path"; then
+                log "[WARN] Failed to prepare custom node ${dir}"
+                exit 1
             fi
         ) &
         pids+=($!)
@@ -251,6 +311,12 @@ function provisioning_download_all_models_parallel() {
 
     local file_count=$(grep -c '^http' "$aria2_input" || echo 0)
     log "Downloading $file_count file(s) with aria2c — max bandwidth, all parallel..."
+
+    if ! command -v aria2c >/dev/null 2>&1; then
+        rm -f "$aria2_input"
+        log "[ERROR] aria2c is unavailable before model download phase"
+        return 1
+    fi
 
     # aria2c tuned for vast.ai 700-5000 Mbps connections downloading ~35GB:
     #   -x 16: 16 connections per server per file (HF CDN supports this)
@@ -396,5 +462,8 @@ function provisioning_download() {
 }
 
 if [[ ! -f /.noprovisioning ]]; then
-    provisioning_start
+    provisioning_start || {
+        touch "$PROVISIONING_FAILED_MARKER"
+        exit 1
+    }
 fi
