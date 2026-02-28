@@ -4,3 +4,4 @@ __pycache__
 bin/
 lib64
 .venv
+.DS_Store

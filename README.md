@@ -6,7 +6,7 @@ This fork is intentionally minimal and only keeps the `comfyui-json` backend use
 
 - `workers/comfyui-json/worker.py` - primary PyWorker backend
 - `start_server.sh` - startup bootstrap script used by Vast templates
-- `provisioning/Provision1.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
+- `default.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
 
 ## What was removed
 
@@ -21,7 +21,7 @@ To reduce maintenance and confusion, unused template workers were removed from t
 
 - `BACKEND=comfyui-json`
 - `PYWORKER_REPO=https://github.com/ByQwank/pyworker`
-- `PROVISIONING_SCRIPT=<raw url to provisioning/Provision1.sh>`
+- `PROVISIONING_SCRIPT=<raw url to default.sh>`
 - `HF_TOKEN=<huggingface token>`
 - `PYWORKER_MANIFEST_SECRET=<shared HMAC secret for LoRA manifests>`
 
@@ -37,7 +37,7 @@ Optional:
 
 Use this URL format in your Vast template:
 
-`https://raw.githubusercontent.com/ByQwank/pyworker/main/provisioning/Provision1.sh`
+`https://raw.githubusercontent.com/ByQwank/pyworker/main/default.sh`
 
 If you pin to a commit, replace `main` with that commit SHA.
 
