@@ -16,12 +16,16 @@ from typing import Any
 from huggingface_hub import hf_hub_download
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
-# ComyUI model configuration
-# Pyworker's ComfyUI transport posts directly to raw ComfyUI endpoints like /prompt,
-# so this base URL must target the actual ComfyUI server, not an external wrapper.
-MODEL_SERVER_BASE_URL = os.getenv("COMFYUI_API_BASE", "http://127.0.0.1:18188").strip().rstrip("/")
+# ComfyUI transport configuration
+# Vast's generic HandlerConfig proxies the same client route to the configured model server
+# route. For comfyui-json that means pyworker must talk to the API wrapper's
+# /generate/sync endpoint, while the wrapper itself talks to raw ComfyUI via its own
+# COMFYUI_API_BASE env var. Keep those env names separate so they don't fight each other.
+MODEL_SERVER_BASE_URL = (
+    os.getenv("PYWORKER_MODEL_SERVER_BASE_URL", "http://127.0.0.1:18288").strip().rstrip("/")
+)
 MODEL_HEALTHCHECK_BASE_URL = (
-    os.getenv("COMFYUI_HEALTHCHECK_BASE", "http://127.0.0.1:18188").strip().rstrip("/")
+    os.getenv("PYWORKER_HEALTHCHECK_BASE_URL", MODEL_SERVER_BASE_URL).strip().rstrip("/")
     or MODEL_SERVER_BASE_URL
 )
 _MODEL_SERVER_PARSED = urlparse(MODEL_SERVER_BASE_URL)
@@ -30,7 +34,9 @@ MODEL_SERVER_HOST = _MODEL_SERVER_PARSED.hostname or "127.0.0.1"
 MODEL_SERVER_PORT = _MODEL_SERVER_PARSED.port or (443 if MODEL_SERVER_SCHEME == "https" else 80)
 MODEL_SERVER_URL = f"{MODEL_SERVER_SCHEME}://{MODEL_SERVER_HOST}"
 MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
-MODEL_HEALTHCHECK_ENDPOINT = os.getenv("COMFYUI_HEALTHCHECK_ENDPOINT", "/system_stats").strip() or "/system_stats"
+MODEL_HEALTHCHECK_ENDPOINT = (
+    os.getenv("PYWORKER_MODEL_HEALTHCHECK_ENDPOINT", "/health").strip() or "/health"
+)
 READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
 PROVISIONING_DONE_MARKER = Path(
     os.getenv("PROVISIONING_DONE_MARKER", "/workspace/.provisioning-complete")
