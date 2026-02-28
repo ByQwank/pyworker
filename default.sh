@@ -97,8 +97,8 @@ function provisioning_start() {
     rm -f "$PROVISIONING_DONE_MARKER" "$PROVISIONING_FAILED_MARKER"
 
     # Phase 1: System deps + pip (sequential, fast)
-    provisioning_get_apt_packages
-    provisioning_get_pip_packages
+    provisioning_get_apt_packages || return 1
+    provisioning_get_pip_packages || return 1
 
     # Enable HuggingFace fast transfer
     export HF_HUB_ENABLE_HF_TRANSFER=1
@@ -109,16 +109,16 @@ function provisioning_start() {
     fi
 
     # Phase 2: Clone all custom nodes in parallel
-    provisioning_get_nodes_parallel
+    provisioning_get_nodes_parallel || return 1
 
     # Phase 3: Install node requirements (must be after nodes are cloned)
-    provisioning_install_node_requirements
+    provisioning_install_node_requirements || return 1
 
     # Phase 4: Download ALL models in parallel using aria2c
-    provisioning_download_all_models_parallel
+    provisioning_download_all_models_parallel || return 1
 
     # Phase 5: Verify critical files
-    provisioning_verify
+    provisioning_verify || return 1
 
     touch "$PROVISIONING_DONE_MARKER"
     provisioning_print_end
@@ -199,13 +199,14 @@ function clone_or_update_repo() {
 function provisioning_get_nodes_parallel() {
     log "Cloning ${#NODES[@]} custom nodes in parallel..."
     local pids=()
+    local failed=0
 
     for repo in "${NODES[@]}"; do
         dir="${repo##*/}"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         (
             if ! clone_or_update_repo "$repo" "$path"; then
-                log "[WARN] Failed to prepare custom node ${dir}"
+                log "[ERROR] Failed to prepare custom node ${dir}"
                 exit 1
             fi
         ) &
@@ -213,8 +214,17 @@ function provisioning_get_nodes_parallel() {
     done
 
     for pid in "${pids[@]}"; do
-        wait $pid 2>/dev/null || log "[WARN] Node clone PID $pid had issues"
+        if ! wait "$pid" 2>/dev/null; then
+            log "[ERROR] Node clone PID $pid failed"
+            failed=1
+        fi
     done
+
+    if [[ $failed -ne 0 ]]; then
+        log "[ERROR] One or more custom node clones failed"
+        return 1
+    fi
+
     log "✓ Custom nodes cloned"
 }
 
@@ -462,8 +472,8 @@ function provisioning_download() {
 }
 
 if [[ ! -f /.noprovisioning ]]; then
-    provisioning_start || {
+    if ! provisioning_start; then
         touch "$PROVISIONING_FAILED_MARKER"
         exit 1
-    }
+    fi
 fi
