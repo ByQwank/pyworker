@@ -6,10 +6,12 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from urllib.parse import urlparse
 
 import aiohttp
+from aiohttp import web
 from pathlib import Path
 from typing import Any
 
@@ -95,12 +97,111 @@ if REQUIRE_SIGNED_MANIFEST and not MANIFEST_SECRET:
 
 IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
+MODEL_DOWNLOAD_ALLOCATION_RULE = "first_request_that_causes_download_pays; cache_hits_pay_zero"
+REQUEST_TELEMETRY_LOCK = threading.Lock()
+REQUEST_TELEMETRY: dict[str, dict[str, Any]] = {}
 
 log = logging.getLogger("custom-comfyui-json-worker")
 
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def build_download_event(
+    *,
+    disposition: str,
+    duration_ms: int,
+    lora_name: str,
+    started_at: int,
+    completed_at: int,
+    transfer_bytes: int = 0,
+    file_size_bytes: int | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "completedAt": completed_at,
+        "disposition": disposition,
+        "durationMs": max(0, int(duration_ms)),
+        "modelName": lora_name,
+        "modelType": "lora",
+        "startedAt": started_at,
+        "transferBytes": max(0, int(transfer_bytes)),
+    }
+
+    if file_size_bytes is not None:
+        event["fileSizeBytes"] = max(0, int(file_size_bytes))
+    if error_message:
+        event["errorMessage"] = error_message
+
+    return event
+
+
+def store_request_telemetry(
+    request_id: str,
+    *,
+    downloads: list[dict[str, Any]],
+    generation_id: str | None = None,
+) -> None:
+    cache_hit_count = 0
+    cache_miss_count = 0
+    shared_cache_hit_count = 0
+    total_download_bytes = 0
+    total_download_duration_ms = 0
+
+    for event in downloads:
+        total_download_bytes += int(event.get("transferBytes", 0) or 0)
+        total_download_duration_ms += int(event.get("durationMs", 0) or 0)
+
+        disposition = event.get("disposition")
+        if disposition == "downloaded":
+            cache_miss_count += 1
+        elif disposition == "cache_hit_existing":
+            cache_hit_count += 1
+        elif disposition == "cache_hit_after_lock":
+            cache_hit_count += 1
+            shared_cache_hit_count += 1
+
+    payload: dict[str, Any] = {
+        "allocationRule": MODEL_DOWNLOAD_ALLOCATION_RULE,
+        "cacheHitCount": cache_hit_count,
+        "cacheMissCount": cache_miss_count,
+        "downloads": downloads,
+        "requestId": request_id,
+        "sharedCacheHitCount": shared_cache_hit_count,
+        "totalDownloadBytes": total_download_bytes,
+        "totalDownloadDurationMs": total_download_duration_ms,
+    }
+    if generation_id:
+        payload["generationId"] = generation_id
+
+    with REQUEST_TELEMETRY_LOCK:
+        REQUEST_TELEMETRY[request_id] = payload
+
+
+def pop_request_telemetry(request_id: str | None) -> dict[str, Any] | None:
+    if not request_id:
+        return None
+
+    with REQUEST_TELEMETRY_LOCK:
+        return REQUEST_TELEMETRY.pop(request_id, None)
+
+
+def extract_request_id(input_payload: dict[str, Any]) -> str | None:
+    request_id = input_payload.get("request_id")
+    return request_id if isinstance(request_id, str) and request_id else None
+
+
+def extract_generation_id(manifest_raw: Any) -> str | None:
+    if not isinstance(manifest_raw, dict):
+        return None
+
+    generation_id = manifest_raw.get("generationId")
+    return generation_id if isinstance(generation_id, str) and generation_id else None
 
 
 def sanitize_lora_name(value: str) -> str | None:
@@ -200,16 +301,28 @@ def parse_and_verify_manifest(manifest: dict[str, Any]) -> list[str]:
     return required_loras
 
 
-def ensure_lora_downloaded(lora_name: str) -> Path:
+def ensure_lora_downloaded(lora_name: str) -> tuple[Path, dict[str, Any]]:
     COMFY_LORA_DIR.mkdir(parents=True, exist_ok=True)
     target_path = COMFY_LORA_DIR / lora_name
     lock_path = COMFY_LORA_DIR / f"{lora_name}.lock"
+    started_at = now_ms()
+    existed_before_lock = target_path.exists()
 
     with open(lock_path, "w", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
 
         if target_path.exists():
-            return target_path
+            completed_at = now_ms()
+            file_size_bytes = target_path.stat().st_size
+            disposition = "cache_hit_existing" if existed_before_lock else "cache_hit_after_lock"
+            return target_path, build_download_event(
+                disposition=disposition,
+                duration_ms=completed_at - started_at,
+                lora_name=lora_name,
+                started_at=started_at,
+                completed_at=completed_at,
+                file_size_bytes=file_size_bytes,
+            )
 
         if not HF_LORA_TOKEN:
             raise RuntimeError("HF_TOKEN is required to download LoRAs.")
@@ -235,7 +348,17 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
         if not target_path.exists():
             raise RuntimeError(f"LoRA download finished but file is missing: {target_path}")
 
-    return target_path
+    completed_at = now_ms()
+    file_size_bytes = target_path.stat().st_size
+    return target_path, build_download_event(
+        disposition="downloaded",
+        duration_ms=completed_at - started_at,
+        lora_name=lora_name,
+        started_at=started_at,
+        completed_at=completed_at,
+        transfer_bytes=file_size_bytes,
+        file_size_bytes=file_size_bytes,
+    )
 
 
 def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
@@ -245,6 +368,7 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
     input_payload = payload.get("input")
     if not isinstance(input_payload, dict):
         raise ValueError("payload.input must be an object.")
+    request_id = extract_request_id(input_payload)
 
     workflow_json = input_payload.get("workflow_json")
     if not isinstance(workflow_json, dict):
@@ -265,6 +389,7 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
 
     manifest_raw = input_payload.get("lora_manifest")
     manifest_loras: list[str] = []
+    generation_id = extract_generation_id(manifest_raw)
     if manifest_raw is not None:
         if not isinstance(manifest_raw, dict):
             raise ValueError("input.lora_manifest must be an object when provided.")
@@ -290,16 +415,68 @@ def ensure_required_loras(payload: dict[str, Any]) -> dict[str, Any]:
         required_set.update(manifest_loras)
 
     required_loras = sorted(required_set)
+    downloads: list[dict[str, Any]] = []
 
     for lora_name in required_loras:
-        ensure_lora_downloaded(lora_name)
+        started_at = now_ms()
+        try:
+            _, event = ensure_lora_downloaded(lora_name)
+            downloads.append(event)
+        except Exception as exc:
+            downloads.append(
+                build_download_event(
+                    disposition="error",
+                    duration_ms=now_ms() - started_at,
+                    lora_name=lora_name,
+                    started_at=started_at,
+                    completed_at=now_ms(),
+                    error_message=str(exc),
+                )
+            )
+            if request_id:
+                store_request_telemetry(request_id, downloads=downloads, generation_id=generation_id)
+            raise
 
     if required_loras:
         log.info("LoRA set ready (%d): %s", len(required_loras), ", ".join(required_loras))
 
+    if request_id:
+        store_request_telemetry(request_id, downloads=downloads, generation_id=generation_id)
+
     input_payload["required_loras"] = required_loras
     payload["input"] = input_payload
     return payload
+
+
+async def generate_response_with_telemetry(client_request: Any, model_response: Any) -> web.Response:
+    request_id: str | None = None
+    try:
+        client_payload = await client_request.json()
+        if isinstance(client_payload, dict):
+            input_payload = client_payload.get("input")
+            if isinstance(input_payload, dict):
+                request_id = extract_request_id(input_payload)
+    except Exception:
+        request_id = None
+
+    telemetry = pop_request_telemetry(request_id)
+    response_body = await model_response.read()
+    content_type = model_response.headers.get("Content-Type", "application/json")
+
+    if telemetry is None:
+        return web.Response(body=response_body, status=model_response.status, content_type=content_type)
+
+    try:
+        decoded = response_body.decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception:
+        return web.Response(body=response_body, status=model_response.status, content_type=content_type)
+
+    if not isinstance(payload, dict):
+        return web.Response(body=response_body, status=model_response.status, content_type=content_type)
+
+    payload["workerTelemetry"] = telemetry
+    return web.json_response(payload, status=model_response.status)
 
 
 def parse_numeric_value(value):
@@ -537,6 +714,7 @@ worker_config = WorkerConfig(
             allow_parallel_requests=False,
             max_queue_time=MAX_QUEUE_TIME,
             request_parser=ensure_required_loras,
+            response_generator=generate_response_with_telemetry,
             workload_calculator=workload_calculator,
             benchmark_config=None,
         ),
