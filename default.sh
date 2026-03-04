@@ -289,15 +289,17 @@ import fcntl
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
-
-from huggingface_hub import hf_hub_download
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
 HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora").strip()
 HF_LORA_TOKEN = os.getenv("HF_TOKEN")
+HF_LORA_RESOLVE_BASE = f"https://huggingface.co/{HF_LORA_REPO}/resolve/main"
 COMFY_LORA_DIR = Path(os.getenv("COMFY_LORA_DIR", "/workspace/ComfyUI/models/loras"))
 IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
@@ -374,22 +376,23 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
             return target_path
 
         logger.info("Downloading LoRA '%s' from '%s'", lora_name, HF_LORA_REPO)
-        downloaded_path = hf_hub_download(
-            repo_id=HF_LORA_REPO,
-            filename=lora_name,
-            repo_type="model",
-            local_dir=str(COMFY_LORA_DIR),
-            local_dir_use_symlinks=False,
-            token=HF_LORA_TOKEN or None,
+        request = Request(
+            f"{HF_LORA_RESOLVE_BASE}/{quote(lora_name)}",
+            headers={
+                "User-Agent": "byqwank-direct-instance/1.0",
+                **(
+                    {"Authorization": f"Bearer {HF_LORA_TOKEN}"}
+                    if HF_LORA_TOKEN
+                    else {}
+                ),
+            },
         )
+        temp_path = target_path.with_suffix(f"{target_path.suffix}.part")
 
-        downloaded_file = Path(downloaded_path)
-        if (
-            downloaded_file.exists()
-            and downloaded_file != target_path
-            and not target_path.exists()
-        ):
-            downloaded_file.replace(target_path)
+        with urlopen(request, timeout=300) as response, open(temp_path, "wb") as output_file:
+            shutil.copyfileobj(response, output_file)
+
+        temp_path.replace(target_path)
 
         if not target_path.exists():
             raise RuntimeError(f"LoRA download finished but file is missing: {target_path}")
