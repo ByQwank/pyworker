@@ -211,9 +211,6 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
         if target_path.exists():
             return target_path
 
-        if not HF_LORA_TOKEN:
-            raise RuntimeError("HF_TOKEN is required to download LoRAs.")
-
         log.info("Downloading LoRA '%s' from '%s'", lora_name, HF_LORA_REPO)
         downloaded_path = hf_hub_download(
             repo_id=HF_LORA_REPO,
@@ -221,7 +218,7 @@ def ensure_lora_downloaded(lora_name: str) -> Path:
             repo_type="model",
             local_dir=str(COMFY_LORA_DIR),
             local_dir_use_symlinks=False,
-            token=HF_LORA_TOKEN,
+            token=HF_LORA_TOKEN or None,
         )
 
         downloaded_file = Path(downloaded_path)

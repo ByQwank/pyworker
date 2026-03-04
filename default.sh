@@ -114,6 +114,11 @@ function provisioning_start() {
     # Phase 3: Install node requirements (must be after nodes are cloned)
     provisioning_install_node_requirements || return 1
 
+    # Phase 3.5: Patch the API wrapper so direct-instance requests can
+    # materialize LoRAs and normalize older workflow node shapes before
+    # generation reaches ComfyUI validation.
+    provisioning_patch_api_wrapper || return 1
+
     # Phase 4: Download ALL models in parallel using aria2c
     provisioning_download_all_models_parallel || return 1
 
@@ -245,6 +250,283 @@ function provisioning_install_node_requirements() {
         fi
     done
     log "✓ Node requirements installed"
+}
+
+function provisioning_patch_api_wrapper() {
+    log "Patching ComfyUI API wrapper for dynamic LoRA sync..."
+
+    local wrapper_preprocess=""
+    local wrapper_root=""
+    local search_roots=("/opt" "/workspace" "/root" "/home")
+
+    for search_root in "${search_roots[@]}"; do
+        if [[ ! -d "$search_root" ]]; then
+            continue
+        fi
+
+        wrapper_preprocess=$(find "$search_root" -path "*/workers/preprocess_worker.py" 2>/dev/null | head -n 1)
+        if [[ -z "$wrapper_preprocess" ]]; then
+            continue
+        fi
+
+        wrapper_root="$(dirname "$(dirname "$wrapper_preprocess")")"
+        if [[ -f "$wrapper_root/main.py" && -f "$wrapper_root/requestmodels/models.py" ]]; then
+            break
+        fi
+
+        wrapper_preprocess=""
+        wrapper_root=""
+    done
+
+    if [[ -z "$wrapper_root" ]]; then
+        log "[WARN] Could not locate ComfyUI API wrapper source; skipping patch"
+        return 0
+    fi
+
+    cat > "${wrapper_root}/workers/lora_sync.py" <<'PY'
+import asyncio
+import fcntl
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+from huggingface_hub import hf_hub_download
+
+logger = logging.getLogger(__name__)
+
+HF_LORA_REPO = os.getenv("HF_LORA_REPO", "Dylaaann/Lora").strip()
+HF_LORA_TOKEN = os.getenv("HF_TOKEN")
+COMFY_LORA_DIR = Path(os.getenv("COMFY_LORA_DIR", "/workspace/ComfyUI/models/loras"))
+IGNORED_LORA_NAMES = {"", "none", "null"}
+LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
+ALLOWED_RIFE_DTYPES = {"float32", "float16", "bfloat16"}
+
+
+def sanitize_lora_name(value: str) -> str | None:
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+
+    normalized = trimmed.split("/")[-1].split("\\")[-1]
+    if normalized.lower() in IGNORED_LORA_NAMES:
+        return None
+
+    if not re.fullmatch(r"[^/\\]+\.safetensors", normalized):
+        raise ValueError(f"Invalid LoRA filename '{value}'.")
+
+    return normalized
+
+
+def extract_workflow_loras(workflow_json: dict[str, Any]) -> list[str]:
+    names: set[str] = set()
+
+    for node in workflow_json.values():
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        for key, raw_value in inputs.items():
+            if not isinstance(key, str) or not LORA_INPUT_KEY_REGEX.fullmatch(key):
+                continue
+            if not isinstance(raw_value, str):
+                continue
+
+            normalized = sanitize_lora_name(raw_value)
+            if normalized:
+                names.add(normalized)
+
+    return sorted(names)
+
+
+def extract_requested_loras(request_input: Any) -> list[str]:
+    raw = getattr(request_input, "required_loras", None)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("input.required_loras must be an array when provided.")
+
+    names: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise ValueError("input.required_loras entries must be strings.")
+
+        normalized = sanitize_lora_name(entry)
+        if normalized:
+            names.add(normalized)
+
+    return sorted(names)
+
+
+def ensure_lora_downloaded(lora_name: str) -> Path:
+    COMFY_LORA_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = COMFY_LORA_DIR / lora_name
+    lock_path = COMFY_LORA_DIR / f"{lora_name}.lock"
+
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        if target_path.exists():
+            return target_path
+
+        logger.info("Downloading LoRA '%s' from '%s'", lora_name, HF_LORA_REPO)
+        downloaded_path = hf_hub_download(
+            repo_id=HF_LORA_REPO,
+            filename=lora_name,
+            repo_type="model",
+            local_dir=str(COMFY_LORA_DIR),
+            local_dir_use_symlinks=False,
+            token=HF_LORA_TOKEN or None,
+        )
+
+        downloaded_file = Path(downloaded_path)
+        if (
+            downloaded_file.exists()
+            and downloaded_file != target_path
+            and not target_path.exists()
+        ):
+            downloaded_file.replace(target_path)
+
+        if not target_path.exists():
+            raise RuntimeError(f"LoRA download finished but file is missing: {target_path}")
+
+    return target_path
+
+
+def normalize_rife_nodes(workflow_json: dict[str, Any]) -> list[str]:
+    patched_node_ids: list[str] = []
+
+    for node_id, node in workflow_json.items():
+        if not isinstance(node, dict) or node.get("class_type") != "RIFE VFI":
+            continue
+
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        changed = False
+
+        dtype = inputs.get("dtype")
+        if not isinstance(dtype, str) or dtype not in ALLOWED_RIFE_DTYPES:
+            inputs["dtype"] = "float32"
+            changed = True
+
+        if not isinstance(inputs.get("torch_compile"), bool):
+            inputs["torch_compile"] = False
+            changed = True
+
+        batch_size = inputs.get("batch_size")
+        normalized_batch_size: int | None = None
+        if isinstance(batch_size, int) and batch_size >= 1:
+            normalized_batch_size = batch_size
+        elif isinstance(batch_size, str):
+            try:
+                parsed = int(batch_size)
+                if parsed >= 1:
+                    normalized_batch_size = parsed
+            except ValueError:
+                normalized_batch_size = None
+
+        if normalized_batch_size is None:
+            inputs["batch_size"] = 1
+            changed = True
+
+        if changed:
+            patched_node_ids.append(str(node_id))
+
+    return patched_node_ids
+
+
+def _prepare_request_input(request_input: Any) -> tuple[list[str], list[str]]:
+    workflow_json = getattr(request_input, "workflow_json", None)
+    if not isinstance(workflow_json, dict) or not workflow_json:
+        return [], []
+
+    patched_node_ids = normalize_rife_nodes(workflow_json)
+    required_loras = sorted(
+        set(extract_workflow_loras(workflow_json)) | set(extract_requested_loras(request_input))
+    )
+
+    for lora_name in required_loras:
+        ensure_lora_downloaded(lora_name)
+
+    request_input.workflow_json = workflow_json
+    return patched_node_ids, required_loras
+
+
+async def ensure_request_workflow_ready(request: Any) -> None:
+    request_input = getattr(request, "input", None)
+    if request_input is None:
+        return
+
+    patched_node_ids, required_loras = await asyncio.to_thread(
+        _prepare_request_input,
+        request_input,
+    )
+
+    if patched_node_ids:
+        logger.info(
+            "Patched workflow compatibility defaults for RIFE VFI nodes: %s",
+            ", ".join(patched_node_ids),
+        )
+
+    if required_loras:
+        logger.info(
+            "LoRA set ready (%d): %s",
+            len(required_loras),
+            ", ".join(required_loras),
+        )
+PY
+
+    python - "$wrapper_root" <<'PY'
+from pathlib import Path
+import sys
+
+wrapper_root = Path(sys.argv[1])
+
+preprocess_path = wrapper_root / "workers" / "preprocess_worker.py"
+preprocess_text = preprocess_path.read_text(encoding="utf-8")
+
+import_line = "from workers.lora_sync import ensure_request_workflow_ready\n"
+if import_line not in preprocess_text:
+    anchor = "from modifiers.basemodifier import BaseModifier\n"
+    if anchor not in preprocess_text:
+        raise SystemExit(f"Expected import anchor missing in {preprocess_path}")
+    preprocess_text = preprocess_text.replace(anchor, anchor + import_line, 1)
+
+call_line = "                await ensure_request_workflow_ready(request)\n\n"
+if call_line not in preprocess_text:
+    anchor = "                # Get and initialize the workflow modifier\n"
+    if anchor not in preprocess_text:
+        raise SystemExit(f"Expected call anchor missing in {preprocess_path}")
+    preprocess_text = preprocess_text.replace(anchor, call_line + anchor, 1)
+
+preprocess_path.write_text(preprocess_text, encoding="utf-8")
+
+models_path = wrapper_root / "requestmodels" / "models.py"
+models_text = models_path.read_text(encoding="utf-8")
+
+required_loras_field = "    required_loras: List[str] = Field(default_factory=list)\n"
+lora_manifest_field = "    lora_manifest: Optional[Dict] = Field(default=None)\n"
+workflow_anchor = "    workflow_json: Dict = Field(default_factory=dict)\n"
+
+if required_loras_field not in models_text or lora_manifest_field not in models_text:
+    if workflow_anchor not in models_text:
+        raise SystemExit(f"Expected workflow_json anchor missing in {models_path}")
+    models_text = models_text.replace(
+        workflow_anchor,
+        workflow_anchor + required_loras_field + lora_manifest_field,
+        1,
+    )
+
+models_path.write_text(models_text, encoding="utf-8")
+PY
+
+    log "✓ Patched ComfyUI API wrapper at ${wrapper_root}"
 }
 
 # Build an aria2c input file and download everything at once
