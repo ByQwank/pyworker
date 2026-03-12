@@ -18,6 +18,7 @@ REPORT_ADDR="${REPORT_ADDR:-https://run.vast.ai}"
 USE_SSL="${USE_SSL:-true}"
 BOOTSTRAP_STATUS_PORT="${WORKER_PORT:-3000}"
 PYWORKER_INTERNAL_PORT="${PYWORKER_INTERNAL_PORT:-3001}"
+PYWORKER_ENABLE_SERVER="${PYWORKER_ENABLE_SERVER:-${SERVERLESS:-false}}"
 export BOOTSTRAP_STATUS_PORT
 READY_ROUTE="${PYWORKER_READY_ROUTE:-/readyz}"
 STATUS_ROUTE="${PYWORKER_STATUS_ROUTE:-/statusz}"
@@ -29,6 +30,17 @@ exec &> >(tee -a "$DEBUG_LOG")
 
 function echo_var(){
     echo "$1: ${!1}"
+}
+
+function is_truthy(){
+    case "${1,,}" in
+        1|true|yes|y|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 function start_bootstrap_status_server(){
@@ -551,6 +563,7 @@ echo_var BACKEND
 echo_var REPORT_ADDR
 echo_var BOOTSTRAP_STATUS_PORT
 echo_var PYWORKER_INTERNAL_PORT
+echo_var PYWORKER_ENABLE_SERVER
 echo_var WORKSPACE_DIR
 echo_var SERVER_DIR
 echo_var ENV_PATH
@@ -692,6 +705,17 @@ fi
 
 wait_for_provisioning_completion
 update_status_file "starting" "Launching pyworker process"
+
+if ! is_truthy "$PYWORKER_ENABLE_SERVER"; then
+    echo "Skipping dedicated pyworker server launch because direct-instance mode is active"
+    update_status_file "starting" "Monitoring direct-instance model server"
+    if [[ -n "${BOOTSTRAP_STATUS_PID:-}" ]]; then
+        wait "$BOOTSTRAP_STATUS_PID"
+    else
+        tail -f /dev/null
+    fi
+    exit 0
+fi
 
 echo "launching PyWorker server"
 
