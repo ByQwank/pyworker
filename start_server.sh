@@ -16,7 +16,9 @@ PROVISIONING_WAIT_INTERVAL_SECONDS="${PROVISIONING_WAIT_INTERVAL_SECONDS:-5}"
 
 REPORT_ADDR="${REPORT_ADDR:-https://run.vast.ai}"
 USE_SSL="${USE_SSL:-true}"
-WORKER_PORT="${WORKER_PORT:-3000}"
+BOOTSTRAP_STATUS_PORT="${WORKER_PORT:-3000}"
+PYWORKER_INTERNAL_PORT="${PYWORKER_INTERNAL_PORT:-3001}"
+export BOOTSTRAP_STATUS_PORT
 READY_ROUTE="${PYWORKER_READY_ROUTE:-/readyz}"
 STATUS_ROUTE="${PYWORKER_STATUS_ROUTE:-/statusz}"
 BOOTSTRAP_STATUS_PID=""
@@ -39,7 +41,7 @@ function start_bootstrap_status_server(){
         return 0
     fi
 
-    echo "Starting bootstrap status server on port ${WORKER_PORT}"
+    echo "Starting bootstrap status server on port ${BOOTSTRAP_STATUS_PORT}"
 
     python3 -u - <<'PY' &
 import json
@@ -48,8 +50,9 @@ import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import error, request
 
-WORKER_PORT = int(os.getenv("WORKER_PORT", "3000"))
+BOOTSTRAP_STATUS_PORT = int(os.getenv("BOOTSTRAP_STATUS_PORT", "3000"))
 READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
 STATUS_ROUTE = os.getenv("PYWORKER_STATUS_ROUTE", "/statusz").strip() or "/statusz"
 STATUS_FILE = Path(os.getenv("PYWORKER_STATUS_FILE", "/workspace/pyworker-status.json"))
@@ -67,6 +70,14 @@ LOW_DISK_FREE_BYTES = int(
     os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
 )
 STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
+MODEL_SERVER_BASE_URL = (
+    os.getenv("PYWORKER_HEALTHCHECK_BASE_URL", os.getenv("PYWORKER_MODEL_SERVER_BASE_URL", "http://127.0.0.1:18288"))
+    .strip()
+    .rstrip("/")
+)
+MODEL_HEALTHCHECK_ENDPOINT = (
+    os.getenv("PYWORKER_MODEL_HEALTHCHECK_ENDPOINT", "/health").strip() or "/health"
+)
 AUTH_TOKENS = {
     token.strip()
     for token in (
@@ -111,6 +122,11 @@ TERMINAL_PATTERNS = (
         "pyworker_exited",
         "PyWorker exited with status",
         "PyWorker process exited unexpectedly during startup.",
+    ),
+    (
+        "bad_gateway_loop",
+        "502 Bad Gateway",
+        "Repeated 502 responses indicate the model server is not becoming healthy.",
     ),
 )
 
@@ -176,7 +192,52 @@ def find_fatal_signals(status_payload: dict, log_map: dict[str, str | None]) -> 
                     }
                 )
                 break
+
+    for source, content in haystacks:
+        lowered = content.lower()
+        if lowered.count("warn exited: comfyui") >= 3:
+            matches.append(
+                {
+                    "code": "comfy_crash_loop",
+                    "message": "ComfyUI appears to be restarting repeatedly.",
+                    "source": source,
+                    "match": "warn exited: comfyui",
+                }
+            )
+            break
+
     return matches
+
+
+def get_model_health() -> dict:
+    health_url = f"{MODEL_SERVER_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
+    req = request.Request(health_url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with request.urlopen(req, timeout=10) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return {
+                "ok": 200 <= response.status < 300,
+                "source": "bootstrap-status-server",
+                "url": health_url,
+                "status": response.status,
+                "bodyPreview": body[:STATUS_BODY_PREVIEW_LIMIT],
+            }
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "source": "bootstrap-status-server",
+            "url": health_url,
+            "status": exc.code,
+            "bodyPreview": body[:STATUS_BODY_PREVIEW_LIMIT],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": "bootstrap-status-server",
+            "url": health_url,
+            "error": str(exc),
+        }
 
 
 def build_phase(
@@ -184,16 +245,17 @@ def build_phase(
     provisioning_done: bool,
     provisioning_failed: bool,
     fatal_signals: list[dict[str, str]],
+    model_health_ok: bool,
 ) -> str:
     if provisioning_failed or fatal_signals:
         return "failed"
     if recorded_phase == "failed":
         return "failed"
-    if recorded_phase in {"provisioning", "starting", "booting"}:
-        return recorded_phase
-    if provisioning_done:
-        return "starting"
-    return "booting"
+    if not provisioning_done:
+        return "provisioning"
+    if model_health_ok:
+        return "ready"
+    return "starting"
 
 
 def build_status() -> dict:
@@ -210,6 +272,7 @@ def build_status() -> dict:
         "tmp": disk_snapshot("/tmp"),
     }
     fatal_signals = find_fatal_signals(status_payload, logs)
+    model_health = get_model_health()
     workspace_free_bytes = disk["workspace"].get("freeBytes")
     if isinstance(workspace_free_bytes, int) and workspace_free_bytes <= LOW_DISK_FREE_BYTES:
         fatal_signals.append(
@@ -226,14 +289,9 @@ def build_status() -> dict:
         provisioning_done=provisioning_done,
         provisioning_failed=provisioning_failed,
         fatal_signals=fatal_signals,
+        model_health_ok=model_health.get("ok") is True,
     )
     should_terminate = phase == "failed"
-    model_health = {
-        "ok": True if phase == "ready" else False,
-        "source": "bootstrap-status-server",
-        "url": None,
-        "status": "bootstrapping" if phase != "failed" else "failed",
-    }
 
     return {
         "ok": phase == "ready",
@@ -319,7 +377,7 @@ class BootstrapStatusHandler(BaseHTTPRequestHandler):
         self._write_json(preview, code)
 
 
-ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), BootstrapStatusHandler).serve_forever()
+ThreadingHTTPServer(("0.0.0.0", BOOTSTRAP_STATUS_PORT), BootstrapStatusHandler).serve_forever()
 PY
 
     BOOTSTRAP_STATUS_PID=$!
@@ -491,7 +549,8 @@ date
 
 echo_var BACKEND
 echo_var REPORT_ADDR
-echo_var WORKER_PORT
+echo_var BOOTSTRAP_STATUS_PORT
+echo_var PYWORKER_INTERNAL_PORT
 echo_var WORKSPACE_DIR
 echo_var SERVER_DIR
 echo_var ENV_PATH
@@ -624,7 +683,8 @@ EOF
     fi
 fi
 
-export REPORT_ADDR WORKER_PORT USE_SSL UNSECURED
+export REPORT_ADDR USE_SSL UNSECURED
+export WORKER_PORT="$PYWORKER_INTERNAL_PORT"
 
 if ! cd "$SERVER_DIR"; then
     report_error_and_exit "Failed to cd into SERVER_DIR: $SERVER_DIR"
@@ -632,7 +692,6 @@ fi
 
 wait_for_provisioning_completion
 update_status_file "starting" "Launching pyworker process"
-stop_bootstrap_status_server
 
 echo "launching PyWorker server"
 
