@@ -136,6 +136,42 @@ TERMINAL_LOG_PATTERNS = (
     ),
 )
 
+JOB_STAGE_PATTERNS = (
+    (
+        "failed",
+        re.compile(r"GenerationWorker \d+ failed job (?P<job>\S+): (?P<detail>.+)"),
+        "Generation failed.",
+    ),
+    (
+        "cancelled",
+        re.compile(r"Job (?P<job>\S+) was cancelled during generation"),
+        "Generation was cancelled.",
+    ),
+    (
+        "postprocess",
+        re.compile(r"PostprocessWorker \d+ processing job: (?P<job>\S+)"),
+        "Postprocessing generated output.",
+    ),
+    (
+        "generation",
+        re.compile(r"GenerationWorker \d+ processing job: (?P<job>\S+)"),
+        "Running ComfyUI generation.",
+    ),
+    (
+        "preprocess",
+        re.compile(r"PreprocessWorker \d+ processing job: (?P<job>\S+)"),
+        "Preparing generation inputs.",
+    ),
+    (
+        "completed",
+        re.compile(r"PostprocessWorker \d+ completed job: (?P<job>\S+)"),
+        "Generation completed.",
+    ),
+)
+
+PROGRESS_LINE_RE = re.compile(r"(?P<percent>\d{1,3})%\|.*?(?P<current>\d+)/(?P<total>\d+)")
+PROMPT_EXECUTED_RE = re.compile(r"Prompt executed in (?P<seconds>[\d.]+) seconds")
+
 
 def safe_read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -161,6 +197,128 @@ def safe_tail_file(path: Path, max_bytes: int = LOG_TAIL_MAX_BYTES) -> str | Non
             return handle.read().decode("utf-8", errors="replace")
     except Exception:
         return None
+
+
+def compact_log_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip()[:240]
+
+
+def extract_recent_progress(logs: dict[str, str | None]) -> dict[str, Any] | None:
+    for source in ("modelTail", "pyworkerTail", "debugTail"):
+        text = logs.get(source)
+        if not isinstance(text, str):
+            continue
+
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = PROGRESS_LINE_RE.search(line)
+            if not match:
+                continue
+
+            try:
+                percent = max(0, min(100, int(match.group("percent"))))
+                current = int(match.group("current"))
+                total = int(match.group("total"))
+            except ValueError:
+                continue
+
+            return {
+                "percent": percent,
+                "current": current,
+                "total": total,
+                "source": source,
+            }
+
+    return None
+
+
+def extract_activity(
+    *,
+    status_file: dict[str, Any],
+    logs: dict[str, str | None],
+    phase: str,
+) -> dict[str, Any]:
+    progress = extract_recent_progress(logs)
+
+    for source in ("pyworkerTail", "modelTail", "debugTail"):
+        text = logs.get(source)
+        if not isinstance(text, str):
+            continue
+
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            for stage, pattern, default_message in JOB_STAGE_PATTERNS:
+                match = pattern.search(line)
+                if not match:
+                    continue
+
+                activity: dict[str, Any] = {
+                    "stage": stage,
+                    "source": source,
+                    "message": default_message,
+                }
+                job_id = match.groupdict().get("job")
+                if job_id:
+                    activity["jobId"] = job_id
+                detail = match.groupdict().get("detail")
+                if detail:
+                    activity["message"] = compact_log_line(detail)
+                if progress and stage in {"preprocess", "generation", "postprocess"}:
+                    activity["progress"] = progress
+                    activity["progressPct"] = progress["percent"]
+                return activity
+
+            lower = line.lower()
+            if "processing interrupted" in lower:
+                return {
+                    "stage": "cancelled",
+                    "source": source,
+                    "message": "Generation processing was interrupted.",
+                }
+
+            prompt_executed = PROMPT_EXECUTED_RE.search(line)
+            if prompt_executed:
+                return {
+                    "stage": "completed",
+                    "source": source,
+                    "message": compact_log_line(line),
+                }
+
+            if "waiting for jobs" in lower and phase == "ready":
+                return {
+                    "stage": "idle",
+                    "source": source,
+                    "message": "Worker ready and waiting for jobs.",
+                }
+
+    status_message = status_file.get("message")
+    if isinstance(status_message, str) and status_message.strip():
+        activity: dict[str, Any] = {
+            "stage": phase if phase != "ready" else "idle",
+            "source": "statusFile.message",
+            "message": compact_log_line(status_message),
+        }
+        if progress and phase in {"preprocess", "generation", "postprocess"}:
+            activity["progress"] = progress
+            activity["progressPct"] = progress["percent"]
+        return activity
+
+    fallback_message = "Worker ready and waiting for jobs." if phase == "ready" else f"Worker phase: {phase}"
+    activity: dict[str, Any] = {
+        "stage": "idle" if phase == "ready" else phase,
+        "source": "phase",
+        "message": fallback_message,
+    }
+    if progress and phase in {"preprocess", "generation", "postprocess"}:
+        activity["progress"] = progress
+        activity["progressPct"] = progress["percent"]
+    return activity
 
 
 def collect_log_signals(source: str, text: str | None) -> list[dict[str, str]]:
@@ -268,6 +426,11 @@ async def build_worker_status() -> dict[str, Any]:
     debug_tail = safe_tail_file(DEBUG_LOG_FILE)
     pyworker_tail = safe_tail_file(PYWORKER_LOG_FILE)
     model_tail = safe_tail_file(Path(MODEL_LOG_FILE))
+    logs = {
+        "debugTail": debug_tail,
+        "pyworkerTail": pyworker_tail,
+        "modelTail": model_tail,
+    }
 
     health = await get_model_health_snapshot()
     log_signals = [
@@ -308,6 +471,11 @@ async def build_worker_status() -> dict[str, Any]:
         if isinstance(status_file.get("phase"), str)
         else None,
     )
+    activity = extract_activity(
+        status_file=status_file,
+        logs=logs,
+        phase=phase,
+    )
 
     return {
         "ok": phase == "ready",
@@ -324,13 +492,10 @@ async def build_worker_status() -> dict[str, Any]:
         },
         "modelHealth": health,
         "disk": disk,
+        "activity": activity,
         "fatalSignals": log_signals,
         "statusFile": status_file,
-        "logs": {
-            "debugTail": debug_tail,
-            "pyworkerTail": pyworker_tail,
-            "modelTail": model_tail,
-        },
+        "logs": logs,
         "updatedAt": int(time.time() * 1000),
     }
 

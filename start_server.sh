@@ -58,6 +58,7 @@ function start_bootstrap_status_server(){
     python3 -u - <<'PY' &
 import json
 import os
+import re
 import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -142,6 +143,42 @@ TERMINAL_PATTERNS = (
     ),
 )
 
+JOB_STAGE_PATTERNS = (
+    (
+        "failed",
+        re.compile(r"GenerationWorker \d+ failed job (?P<job>\S+): (?P<detail>.+)"),
+        "Generation failed.",
+    ),
+    (
+        "cancelled",
+        re.compile(r"Job (?P<job>\S+) was cancelled during generation"),
+        "Generation was cancelled.",
+    ),
+    (
+        "postprocess",
+        re.compile(r"PostprocessWorker \d+ processing job: (?P<job>\S+)"),
+        "Postprocessing generated output.",
+    ),
+    (
+        "generation",
+        re.compile(r"GenerationWorker \d+ processing job: (?P<job>\S+)"),
+        "Running ComfyUI generation.",
+    ),
+    (
+        "preprocess",
+        re.compile(r"PreprocessWorker \d+ processing job: (?P<job>\S+)"),
+        "Preparing generation inputs.",
+    ),
+    (
+        "completed",
+        re.compile(r"PostprocessWorker \d+ completed job: (?P<job>\S+)"),
+        "Generation completed.",
+    ),
+)
+
+PROGRESS_LINE_RE = re.compile(r"(?P<percent>\d{1,3})%\|.*?(?P<current>\d+)/(?P<total>\d+)")
+PROMPT_EXECUTED_RE = re.compile(r"Prompt executed in (?P<seconds>[\d.]+) seconds")
+
 
 def safe_read_json(path: Path) -> dict:
     if not path.exists():
@@ -165,6 +202,123 @@ def tail_text(path: Path, limit: int) -> str | None:
     except OSError:
         return None
     return data[-limit:]
+
+
+def compact_log_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip()[:240]
+
+
+def extract_recent_progress(logs: dict[str, str | None]) -> dict | None:
+    for source in ("modelLogTail", "pyworkerLogTail", "debugLogTail"):
+        text = logs.get(source)
+        if not isinstance(text, str):
+            continue
+
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = PROGRESS_LINE_RE.search(line)
+            if not match:
+                continue
+
+            try:
+                percent = max(0, min(100, int(match.group("percent"))))
+                current = int(match.group("current"))
+                total = int(match.group("total"))
+            except ValueError:
+                continue
+
+            return {
+                "percent": percent,
+                "current": current,
+                "total": total,
+                "source": source,
+            }
+
+    return None
+
+
+def extract_activity(status_payload: dict, logs: dict[str, str | None], phase: str) -> dict:
+    progress = extract_recent_progress(logs)
+
+    for source in ("pyworkerLogTail", "modelLogTail", "debugLogTail"):
+        text = logs.get(source)
+        if not isinstance(text, str):
+            continue
+
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            for stage, pattern, default_message in JOB_STAGE_PATTERNS:
+                match = pattern.search(line)
+                if not match:
+                    continue
+
+                activity = {
+                    "stage": stage,
+                    "source": source,
+                    "message": default_message,
+                }
+                job_id = match.groupdict().get("job")
+                if job_id:
+                    activity["jobId"] = job_id
+                detail = match.groupdict().get("detail")
+                if detail:
+                    activity["message"] = compact_log_line(detail)
+                if progress and stage in {"preprocess", "generation", "postprocess"}:
+                    activity["progress"] = progress
+                    activity["progressPct"] = progress["percent"]
+                return activity
+
+            lower = line.lower()
+            if "processing interrupted" in lower:
+                return {
+                    "stage": "cancelled",
+                    "source": source,
+                    "message": "Generation processing was interrupted.",
+                }
+
+            prompt_executed = PROMPT_EXECUTED_RE.search(line)
+            if prompt_executed:
+                return {
+                    "stage": "completed",
+                    "source": source,
+                    "message": compact_log_line(line),
+                }
+
+            if "waiting for jobs" in lower and phase == "ready":
+                return {
+                    "stage": "idle",
+                    "source": source,
+                    "message": "Worker ready and waiting for jobs.",
+                }
+
+    status_message = status_payload.get("message")
+    if isinstance(status_message, str) and status_message.strip():
+        activity = {
+            "stage": phase if phase != "ready" else "idle",
+            "source": "status.message",
+            "message": compact_log_line(status_message),
+        }
+        if progress and phase in {"preprocess", "generation", "postprocess"}:
+            activity["progress"] = progress
+            activity["progressPct"] = progress["percent"]
+        return activity
+
+    fallback_message = "Worker ready and waiting for jobs." if phase == "ready" else f"Worker phase: {phase}"
+    activity = {
+        "stage": "idle" if phase == "ready" else phase,
+        "source": "phase",
+        "message": fallback_message,
+    }
+    if progress and phase in {"preprocess", "generation", "postprocess"}:
+        activity["progress"] = progress
+        activity["progressPct"] = progress["percent"]
+    return activity
 
 
 def disk_snapshot(path: str) -> dict[str, int | None]:
@@ -304,6 +458,7 @@ def build_status() -> dict:
         model_health_ok=model_health.get("ok") is True,
     )
     should_terminate = phase == "failed"
+    activity = extract_activity(status_payload, logs, phase)
 
     return {
         "ok": phase == "ready",
@@ -318,6 +473,7 @@ def build_status() -> dict:
         },
         "disk": disk,
         "modelHealth": model_health,
+        "activity": activity,
         "logs": logs,
         "bootstrapServer": True,
         "updatedAt": int(time.time() * 1000),
