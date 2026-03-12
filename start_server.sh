@@ -67,10 +67,15 @@ LOW_DISK_FREE_BYTES = int(
     os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
 )
 STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
-AUTH_TOKEN = (
-    os.getenv("OPEN_BUTTON_TOKEN", "").strip()
-    or os.getenv("WEB_PASSWORD", "").strip()
-)
+AUTH_TOKENS = {
+    token.strip()
+    for token in (
+        os.getenv("OPEN_BUTTON_TOKEN", ""),
+        os.getenv("WEB_PASSWORD", ""),
+        os.getenv("JUPYTER_TOKEN", ""),
+    )
+    if token and token.strip()
+}
 AUTH_REQUIRED = (
     os.getenv("ENABLE_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}
     or os.getenv("UNSECURED", "").strip().lower() in {"0", "false", "no", "off"}
@@ -256,10 +261,25 @@ class BootstrapStatusHandler(BaseHTTPRequestHandler):
         print(f"[bootstrap-status] {self.address_string()} - {fmt % args}", flush=True)
 
     def _authorized(self) -> bool:
-        if not AUTH_REQUIRED or not AUTH_TOKEN:
+        if not AUTH_REQUIRED or not AUTH_TOKENS:
             return True
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {AUTH_TOKEN}"
+        if any(header == f"Bearer {token}" for token in AUTH_TOKENS):
+            return True
+
+        basic = self.headers.get("Authorization", "")
+        if basic.startswith("Basic "):
+            import base64
+
+            try:
+                raw = base64.b64decode(basic[6:]).decode("utf-8")
+            except Exception:
+                return False
+            username, _, password = raw.partition(":")
+            if username == "vastai" and password in AUTH_TOKENS:
+                return True
+
+        return False
 
     def _write_json(self, payload: dict, status_code: int) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
