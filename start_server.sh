@@ -177,6 +177,10 @@ JOB_STAGE_PATTERNS = (
 )
 
 PROGRESS_LINE_RE = re.compile(r"(?P<percent>\d{1,3})%\|.*?(?P<current>\d+)/(?P<total>\d+)")
+GENERATION_PROGRESS_RE = re.compile(
+    r"Progress update:\s*Progress:\s*(?P<percent>\d+(?:\.\d+)?)%\s*\((?P<current>\d+)/(?P<total>\d+)\)"
+)
+PROVISIONING_PROGRESS_PERCENT_RE = re.compile(r"\((?P<percent>\d{1,3})%\)")
 PROMPT_EXECUTED_RE = re.compile(r"Prompt executed in (?P<seconds>[\d.]+) seconds")
 
 
@@ -208,6 +212,60 @@ def compact_log_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()[:240]
 
 
+def parse_progress_line(line: str, source: str) -> dict | None:
+    generation_match = GENERATION_PROGRESS_RE.search(line)
+    if generation_match:
+        try:
+            percent = float(generation_match.group("percent"))
+            current = int(generation_match.group("current"))
+            total = int(generation_match.group("total"))
+        except ValueError:
+            return None
+
+        return {
+            "kind": "generation",
+            "percent": max(0, min(100, round(percent, 1))),
+            "current": current,
+            "total": total,
+            "source": source,
+        }
+
+    match = PROGRESS_LINE_RE.search(line)
+    if match:
+        try:
+            percent = int(match.group("percent"))
+            current = int(match.group("current"))
+            total = int(match.group("total"))
+        except ValueError:
+            return None
+
+        return {
+            "kind": "generation",
+            "percent": max(0, min(100, percent)),
+            "current": current,
+            "total": total,
+            "source": source,
+        }
+
+    if "[DL:" in line:
+        percentages = [
+            int(value)
+            for value in PROVISIONING_PROGRESS_PERCENT_RE.findall(line)
+            if value.isdigit()
+        ]
+        if not percentages:
+            return None
+
+        return {
+            "kind": "provisioning",
+            "percent": round(sum(percentages) / len(percentages), 1),
+            "source": source,
+            "detail": compact_log_line(line),
+        }
+
+    return None
+
+
 def extract_recent_progress(logs: dict[str, str | None]) -> dict | None:
     for source in ("modelLogTail", "pyworkerLogTail", "debugLogTail"):
         text = logs.get(source)
@@ -219,23 +277,9 @@ def extract_recent_progress(logs: dict[str, str | None]) -> dict | None:
             if not line:
                 continue
 
-            match = PROGRESS_LINE_RE.search(line)
-            if not match:
-                continue
-
-            try:
-                percent = max(0, min(100, int(match.group("percent"))))
-                current = int(match.group("current"))
-                total = int(match.group("total"))
-            except ValueError:
-                continue
-
-            return {
-                "percent": percent,
-                "current": current,
-                "total": total,
-                "source": source,
-            }
+            progress = parse_progress_line(line, source)
+            if progress:
+                return progress
 
     return None
 
@@ -252,6 +296,39 @@ def extract_activity(status_payload: dict, logs: dict[str, str | None], phase: s
             line = raw_line.strip()
             if not line:
                 continue
+
+            progress_line = parse_progress_line(line, source)
+            if progress_line and progress_line.get("kind") == "generation":
+                current = progress_line.get("current")
+                total = progress_line.get("total")
+                percent = progress_line.get("percent")
+                message = "Running ComfyUI generation."
+                if isinstance(current, int) and isinstance(total, int):
+                    message = f"Running ComfyUI generation ({current}/{total})."
+                return {
+                    "stage": "generation",
+                    "source": source,
+                    "message": message,
+                    "progress": progress_line,
+                    "progressPct": percent,
+                }
+
+            if (
+                phase == "provisioning"
+                and progress_line
+                and progress_line.get("kind") == "provisioning"
+            ):
+                percent = progress_line.get("percent")
+                message = "Downloading provisioning assets."
+                if isinstance(percent, (int, float)):
+                    message = f"Downloading provisioning assets ({percent}%)."
+                return {
+                    "stage": "provisioning",
+                    "source": source,
+                    "message": message,
+                    "progress": progress_line,
+                    "progressPct": progress_line.get("percent"),
+                }
 
             for stage, pattern, default_message in JOB_STAGE_PATTERNS:
                 match = pattern.search(line)
@@ -304,7 +381,7 @@ def extract_activity(status_payload: dict, logs: dict[str, str | None], phase: s
             "source": "status.message",
             "message": compact_log_line(status_message),
         }
-        if progress and phase in {"preprocess", "generation", "postprocess"}:
+        if progress and phase in {"provisioning", "preprocess", "generation", "postprocess"}:
             activity["progress"] = progress
             activity["progressPct"] = progress["percent"]
         return activity
@@ -315,7 +392,7 @@ def extract_activity(status_payload: dict, logs: dict[str, str | None], phase: s
         "source": "phase",
         "message": fallback_message,
     }
-    if progress and phase in {"preprocess", "generation", "postprocess"}:
+    if progress and phase in {"provisioning", "preprocess", "generation", "postprocess"}:
         activity["progress"] = progress
         activity["progressPct"] = progress["percent"]
     return activity
