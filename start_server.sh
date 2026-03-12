@@ -17,6 +17,9 @@ PROVISIONING_WAIT_INTERVAL_SECONDS="${PROVISIONING_WAIT_INTERVAL_SECONDS:-5}"
 REPORT_ADDR="${REPORT_ADDR:-https://run.vast.ai}"
 USE_SSL="${USE_SSL:-true}"
 WORKER_PORT="${WORKER_PORT:-3000}"
+READY_ROUTE="${PYWORKER_READY_ROUTE:-/readyz}"
+STATUS_ROUTE="${PYWORKER_STATUS_ROUTE:-/statusz}"
+BOOTSTRAP_STATUS_PID=""
 mkdir -p "$WORKSPACE_DIR"
 cd "$WORKSPACE_DIR"
 
@@ -25,6 +28,300 @@ exec &> >(tee -a "$DEBUG_LOG")
 function echo_var(){
     echo "$1: ${!1}"
 }
+
+function start_bootstrap_status_server(){
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "WARNING: python3 not found, bootstrap status server disabled"
+        return 0
+    fi
+
+    if [[ -n "${BOOTSTRAP_STATUS_PID:-}" ]] && kill -0 "$BOOTSTRAP_STATUS_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "Starting bootstrap status server on port ${WORKER_PORT}"
+
+    python3 -u - <<'PY' &
+import json
+import os
+import shutil
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+WORKER_PORT = int(os.getenv("WORKER_PORT", "3000"))
+READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
+STATUS_ROUTE = os.getenv("PYWORKER_STATUS_ROUTE", "/statusz").strip() or "/statusz"
+STATUS_FILE = Path(os.getenv("PYWORKER_STATUS_FILE", "/workspace/pyworker-status.json"))
+DEBUG_LOG_FILE = Path(os.getenv("PYWORKER_DEBUG_LOG_FILE", "/workspace/debug.log"))
+PYWORKER_LOG_FILE = Path(os.getenv("PYWORKER_LOG_FILE", "/workspace/pyworker.log"))
+MODEL_LOG_FILE = Path(os.getenv("MODEL_LOG", "/var/log/portal/comfyui.log"))
+PROVISIONING_DONE_MARKER = Path(
+    os.getenv("PROVISIONING_DONE_MARKER", "/workspace/.provisioning-complete")
+)
+PROVISIONING_FAILED_MARKER = Path(
+    os.getenv("PROVISIONING_FAILED_MARKER", "/workspace/.provisioning-failed")
+)
+LOG_TAIL_MAX_BYTES = int(os.getenv("PYWORKER_LOG_TAIL_MAX_BYTES", "8192"))
+LOW_DISK_FREE_BYTES = int(
+    os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
+)
+STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
+AUTH_TOKEN = (
+    os.getenv("OPEN_BUTTON_TOKEN", "").strip()
+    or os.getenv("WEB_PASSWORD", "").strip()
+)
+AUTH_REQUIRED = (
+    os.getenv("ENABLE_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}
+    or os.getenv("UNSECURED", "").strip().lower() in {"0", "false", "no", "off"}
+)
+
+TERMINAL_PATTERNS = (
+    (
+        "disk_full",
+        "No space left on device",
+        "Disk is full. Worker should be terminated and reprovisioned.",
+    ),
+    (
+        "comfy_prestartup_failed",
+        "PRESTARTUP FAILED",
+        "A ComfyUI custom node failed during startup.",
+    ),
+    (
+        "torch_dynamo_circular_import",
+        "torch._dynamo' has no attribute 'guards'",
+        "Torch/einops import failed during ComfyUI startup.",
+    ),
+    (
+        "provisioning_failed",
+        "Provisioning failed",
+        "Provisioning reported a fatal failure before the worker became ready.",
+    ),
+    (
+        "provisioning_script_failed",
+        "[ERROR] Provisioning Script failed",
+        "Provisioning script exited with a fatal error.",
+    ),
+    (
+        "pyworker_exited",
+        "PyWorker exited with status",
+        "PyWorker process exited unexpectedly during startup.",
+    ),
+)
+
+
+def safe_read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def tail_text(path: Path, limit: int) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - limit), os.SEEK_SET)
+            data = file.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return data[-limit:]
+
+
+def disk_snapshot(path: str) -> dict[str, int | None]:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"totalBytes": None, "usedBytes": None, "freeBytes": None}
+    return {
+        "totalBytes": usage.total,
+        "usedBytes": usage.used,
+        "freeBytes": usage.free,
+    }
+
+
+def find_fatal_signals(status_payload: dict, log_map: dict[str, str | None]) -> list[dict[str, str]]:
+    haystacks: list[tuple[str, str]] = []
+    message = status_payload.get("message")
+    if isinstance(message, str) and message:
+        haystacks.append(("status.message", message))
+    error_message = status_payload.get("errorMessage")
+    if isinstance(error_message, str) and error_message:
+        haystacks.append(("status.errorMessage", error_message))
+    for name, content in log_map.items():
+        if isinstance(content, str) and content:
+            haystacks.append((name, content))
+
+    matches: list[dict[str, str]] = []
+    for code, needle, description in TERMINAL_PATTERNS:
+        for source, content in haystacks:
+            if needle in content:
+                matches.append(
+                    {
+                        "code": code,
+                        "message": description,
+                        "source": source,
+                        "match": needle,
+                    }
+                )
+                break
+    return matches
+
+
+def build_phase(
+    recorded_phase: str | None,
+    provisioning_done: bool,
+    provisioning_failed: bool,
+    fatal_signals: list[dict[str, str]],
+) -> str:
+    if provisioning_failed or fatal_signals:
+        return "failed"
+    if recorded_phase == "failed":
+        return "failed"
+    if recorded_phase in {"provisioning", "starting", "booting"}:
+        return recorded_phase
+    if provisioning_done:
+        return "starting"
+    return "booting"
+
+
+def build_status() -> dict:
+    status_payload = safe_read_json(STATUS_FILE)
+    logs = {
+        "debugLogTail": tail_text(DEBUG_LOG_FILE, LOG_TAIL_MAX_BYTES),
+        "pyworkerLogTail": tail_text(PYWORKER_LOG_FILE, LOG_TAIL_MAX_BYTES),
+        "modelLogTail": tail_text(MODEL_LOG_FILE, LOG_TAIL_MAX_BYTES),
+    }
+    provisioning_done = PROVISIONING_DONE_MARKER.exists()
+    provisioning_failed = PROVISIONING_FAILED_MARKER.exists()
+    disk = {
+        "workspace": disk_snapshot(str(PROVISIONING_DONE_MARKER.parent)),
+        "tmp": disk_snapshot("/tmp"),
+    }
+    fatal_signals = find_fatal_signals(status_payload, logs)
+    workspace_free_bytes = disk["workspace"].get("freeBytes")
+    if isinstance(workspace_free_bytes, int) and workspace_free_bytes <= LOW_DISK_FREE_BYTES:
+        fatal_signals.append(
+            {
+                "code": "workspace_low_disk",
+                "message": "Workspace free disk is below the low-water mark.",
+                "source": "disk.workspace",
+                "match": str(workspace_free_bytes),
+            }
+        )
+
+    phase = build_phase(
+        status_payload.get("phase") if isinstance(status_payload.get("phase"), str) else None,
+        provisioning_done=provisioning_done,
+        provisioning_failed=provisioning_failed,
+        fatal_signals=fatal_signals,
+    )
+    should_terminate = phase == "failed"
+    model_health = {
+        "ok": True if phase == "ready" else False,
+        "source": "bootstrap-status-server",
+        "url": None,
+        "status": "bootstrapping" if phase != "failed" else "failed",
+    }
+
+    return {
+        "ok": phase == "ready",
+        "phase": phase,
+        "shouldTerminate": should_terminate,
+        "message": status_payload.get("message"),
+        "errorMessage": status_payload.get("errorMessage"),
+        "fatalSignals": fatal_signals,
+        "provisioning": {
+            "doneMarkerExists": provisioning_done,
+            "failedMarkerExists": provisioning_failed,
+        },
+        "disk": disk,
+        "modelHealth": model_health,
+        "logs": logs,
+        "bootstrapServer": True,
+        "updatedAt": int(time.time() * 1000),
+    }
+
+
+class BootstrapStatusHandler(BaseHTTPRequestHandler):
+    server_version = "PyworkerBootstrapStatus/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"[bootstrap-status] {self.address_string()} - {fmt % args}", flush=True)
+
+    def _authorized(self) -> bool:
+        if not AUTH_REQUIRED or not AUTH_TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        return header == f"Bearer {AUTH_TOKEN}"
+
+    def _write_json(self, payload: dict, status_code: int) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path not in {READY_ROUTE, STATUS_ROUTE, "/health"}:
+            self._write_json({"error": "not_found"}, 404)
+            return
+
+        if not self._authorized():
+            self._write_json({"error": "unauthorized"}, 401)
+            return
+
+        status_payload = build_status()
+        if self.path == STATUS_ROUTE:
+            self._write_json(status_payload, 200)
+            return
+
+        if status_payload["shouldTerminate"] is True:
+            code = 500
+        elif status_payload["ok"] is True:
+            code = 200
+        else:
+            code = 425
+
+        preview = dict(status_payload)
+        if isinstance(preview.get("logs"), dict):
+            preview["logs"] = {
+                key: (value[-STATUS_BODY_PREVIEW_LIMIT:] if isinstance(value, str) else value)
+                for key, value in preview["logs"].items()
+            }
+        self._write_json(preview, code)
+
+
+ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), BootstrapStatusHandler).serve_forever()
+PY
+
+    BOOTSTRAP_STATUS_PID=$!
+    echo "Bootstrap status server PID: ${BOOTSTRAP_STATUS_PID}"
+}
+
+function stop_bootstrap_status_server(){
+    local pid="${BOOTSTRAP_STATUS_PID:-}"
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping bootstrap status server PID: ${pid}"
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+
+    BOOTSTRAP_STATUS_PID=""
+}
+
+trap 'stop_bootstrap_status_server' EXIT
 
 function update_status_file(){
     local phase="$1"
@@ -166,6 +463,8 @@ update_status_file "booting" "start_server.sh bootstrapping"
 
 [ -z "$CONTAINER_ID" ] && report_error_and_exit "CONTAINER_ID must be set!"
 [ "$BACKEND" = "comfyui" ] && [ -z "$COMFY_MODEL" ] && report_error_and_exit "For comfyui backends, COMFY_MODEL must be set!"
+
+start_bootstrap_status_server
 
 echo "start_server.sh"
 date
@@ -313,6 +612,7 @@ fi
 
 wait_for_provisioning_completion
 update_status_file "starting" "Launching pyworker process"
+stop_bootstrap_status_server
 
 echo "launching PyWorker server"
 

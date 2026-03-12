@@ -9,6 +9,7 @@ This fork is intentionally minimal and only keeps the `comfyui-json` backend use
 - `default.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
 - `GET /readyz` - readiness route for Trigger/Vast boot checks
 - `GET /statusz` - structured machine status, fatal signals, disk state, and recent log tails
+- bootstrap status server on the raw PyWorker port so `/statusz` is reachable during provisioning before the real worker starts
 
 ## What was removed
 
@@ -26,6 +27,7 @@ To reduce maintenance and confusion, unused template workers were removed from t
 - `PROVISIONING_SCRIPT=<raw url to default.sh>`
 - `HF_TOKEN=<huggingface token>`
 - `PYWORKER_MANIFEST_SECRET=<shared HMAC secret for LoRA manifests>`
+- expose the raw PyWorker port in your Vast template, e.g. `-p 3000:3000`
 
 Optional:
 
