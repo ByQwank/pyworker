@@ -7,6 +7,8 @@ This fork is intentionally minimal and only keeps the `comfyui-json` backend use
 - `workers/comfyui-json/worker.py` - primary PyWorker backend
 - `start_server.sh` - startup bootstrap script used by Vast templates
 - `default.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
+- `GET /readyz` - readiness route for Trigger/Vast boot checks
+- `GET /statusz` - structured machine status, fatal signals, disk state, and recent log tails
 
 ## What was removed
 

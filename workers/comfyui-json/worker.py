@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import time
 from urllib.parse import urlparse
 
@@ -38,12 +39,21 @@ MODEL_HEALTHCHECK_ENDPOINT = (
     os.getenv("PYWORKER_MODEL_HEALTHCHECK_ENDPOINT", "/health").strip() or "/health"
 )
 READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
+STATUS_ROUTE = os.getenv("PYWORKER_STATUS_ROUTE", "/statusz").strip() or "/statusz"
 PROVISIONING_DONE_MARKER = Path(
     os.getenv("PROVISIONING_DONE_MARKER", "/workspace/.provisioning-complete")
 )
 PROVISIONING_FAILED_MARKER = Path(
     os.getenv("PROVISIONING_FAILED_MARKER", "/workspace/.provisioning-failed")
 )
+STATUS_FILE = Path(os.getenv("PYWORKER_STATUS_FILE", "/workspace/pyworker-status.json"))
+DEBUG_LOG_FILE = Path(os.getenv("PYWORKER_DEBUG_LOG_FILE", "/workspace/debug.log"))
+PYWORKER_LOG_FILE = Path(os.getenv("PYWORKER_LOG_FILE", "/workspace/pyworker.log"))
+LOG_TAIL_MAX_BYTES = int(os.getenv("PYWORKER_LOG_TAIL_MAX_BYTES", "8192"))
+LOW_DISK_FREE_BYTES = int(
+    os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
+)
+STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
 
 # ComyUI-specific log messages
 MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
@@ -97,6 +107,232 @@ IGNORED_LORA_NAMES = {"", "none", "null"}
 LORA_INPUT_KEY_REGEX = re.compile(r"^lora(?:_\d+)?_name$", re.IGNORECASE)
 
 log = logging.getLogger("custom-comfyui-json-worker")
+
+TERMINAL_LOG_PATTERNS = (
+    (
+        "disk_full",
+        "No space left on device",
+        "Disk is full. Worker should be terminated and reprovisioned.",
+    ),
+    (
+        "comfy_prestartup_failed",
+        "PRESTARTUP FAILED",
+        "A ComfyUI custom node failed during startup.",
+    ),
+    (
+        "torch_dynamo_guards_missing",
+        "torch._dynamo' has no attribute 'guards",
+        "Torch/einops import failed during ComfyUI startup.",
+    ),
+    (
+        "provisioning_failed",
+        "Provisioning failed",
+        "Provisioning reported a fatal failure before the worker became ready.",
+    ),
+    (
+        "provisioning_script_failed",
+        "[ERROR] Provisioning Script failed",
+        "Provisioning script logged a fatal error.",
+    ),
+)
+
+
+def safe_read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    return raw if isinstance(raw, dict) else {}
+
+
+def safe_tail_file(path: Path, max_bytes: int = LOG_TAIL_MAX_BYTES) -> str | None:
+    if max_bytes <= 0 or not path.exists() or not path.is_file():
+        return None
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            return handle.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def collect_log_signals(source: str, text: str | None) -> list[dict[str, str]]:
+    if not text:
+        return []
+
+    signals: list[dict[str, str]] = []
+    for code, needle, message in TERMINAL_LOG_PATTERNS:
+        if needle.lower() in text.lower():
+            signals.append(
+                {
+                    "code": code,
+                    "source": source,
+                    "message": message,
+                }
+            )
+
+    lower = text.lower()
+    if lower.count("warn exited: comfyui") >= 3:
+        signals.append(
+            {
+                "code": "comfy_crash_loop",
+                "source": source,
+                "message": "ComfyUI appears to be restarting repeatedly.",
+            }
+        )
+    if lower.count("502 bad gateway") >= 3:
+        signals.append(
+            {
+                "code": "bad_gateway_loop",
+                "source": source,
+                "message": "Repeated 502 health failures indicate the model server is not becoming healthy.",
+            }
+        )
+
+    deduped: dict[tuple[str, str], dict[str, str]] = {}
+    for signal in signals:
+        deduped[(signal["code"], signal["source"])] = signal
+    return list(deduped.values())
+
+
+async def get_model_health_snapshot() -> dict[str, Any]:
+    health_url = f"{MODEL_HEALTHCHECK_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(health_url) as response:
+                body = await response.text()
+                return {
+                    "ok": response.status == 200,
+                    "status": response.status,
+                    "url": health_url,
+                    "bodyPreview": body[:STATUS_BODY_PREVIEW_LIMIT],
+                }
+    except Exception as error:
+        return {
+            "ok": False,
+            "url": health_url,
+            "error": str(error),
+        }
+
+
+def get_disk_snapshot(path: str) -> dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception as error:
+        return {
+            "path": path,
+            "error": str(error),
+        }
+
+    return {
+        "path": path,
+        "totalBytes": usage.total,
+        "usedBytes": usage.used,
+        "freeBytes": usage.free,
+        "isLow": usage.free <= LOW_DISK_FREE_BYTES,
+    }
+
+
+def build_phase(
+    *,
+    provisioning_failed: bool,
+    provisioning_done: bool,
+    model_health_ok: bool,
+    fatal_signals: list[dict[str, str]],
+    recorded_phase: str | None,
+) -> str:
+    if provisioning_failed:
+        return "failed"
+    if fatal_signals:
+        return "failed"
+    if not provisioning_done:
+        return "provisioning"
+    if model_health_ok:
+        return "ready"
+    if recorded_phase == "failed":
+        return "failed"
+    return "starting"
+
+
+async def build_worker_status() -> dict[str, Any]:
+    status_file = safe_read_json_file(STATUS_FILE)
+    debug_tail = safe_tail_file(DEBUG_LOG_FILE)
+    pyworker_tail = safe_tail_file(PYWORKER_LOG_FILE)
+    model_tail = safe_tail_file(Path(MODEL_LOG_FILE))
+
+    health = await get_model_health_snapshot()
+    log_signals = [
+        *collect_log_signals("debug", debug_tail),
+        *collect_log_signals("pyworker", pyworker_tail),
+        *collect_log_signals("model", model_tail),
+    ]
+
+    provisioning_failed = PROVISIONING_FAILED_MARKER.exists()
+    provisioning_done = PROVISIONING_DONE_MARKER.exists()
+    disk = {
+        "workspace": get_disk_snapshot(str(PROVISIONING_DONE_MARKER.parent)),
+        "tmp": get_disk_snapshot("/tmp"),
+    }
+    if disk["workspace"].get("isLow"):
+        log_signals.append(
+            {
+                "code": "workspace_low_disk",
+                "source": "workspace",
+                "message": "Workspace disk free space is below the safety threshold.",
+            }
+        )
+    if disk["tmp"].get("isLow"):
+        log_signals.append(
+            {
+                "code": "tmp_low_disk",
+                "source": "tmp",
+                "message": "Temporary disk free space is below the safety threshold.",
+            }
+        )
+
+    phase = build_phase(
+        provisioning_failed=provisioning_failed,
+        provisioning_done=provisioning_done,
+        model_health_ok=health.get("ok") is True,
+        fatal_signals=log_signals,
+        recorded_phase=status_file.get("phase")
+        if isinstance(status_file.get("phase"), str)
+        else None,
+    )
+
+    return {
+        "ok": phase == "ready",
+        "phase": phase,
+        "shouldTerminate": phase == "failed",
+        "instance": {
+            "containerId": os.getenv("CONTAINER_ID"),
+            "machineId": os.getenv("MACHINE_ID"),
+            "hostName": os.getenv("HOSTNAME"),
+        },
+        "provisioning": {
+            "doneMarkerExists": provisioning_done,
+            "failedMarkerExists": provisioning_failed,
+        },
+        "modelHealth": health,
+        "disk": disk,
+        "fatalSignals": log_signals,
+        "statusFile": status_file,
+        "logs": {
+            "debugTail": debug_tail,
+            "pyworkerTail": pyworker_tail,
+            "modelTail": model_tail,
+        },
+        "updatedAt": int(time.time() * 1000),
+    }
 
 
 def canonical_json(value: Any) -> str:
@@ -474,28 +710,28 @@ async def bootstrap_ping_remote(**params):
 
 
 async def readyz_remote(**params):
-    if PROVISIONING_FAILED_MARKER.exists():
-        raise RuntimeError(f"Provisioning failed: {PROVISIONING_FAILED_MARKER}")
-    if not PROVISIONING_DONE_MARKER.exists():
-        raise RuntimeError(f"Provisioning not complete: {PROVISIONING_DONE_MARKER}")
-
-    health_url = f"{MODEL_HEALTHCHECK_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
-    timeout = aiohttp.ClientTimeout(total=10)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(health_url) as response:
-            body = await response.text()
-            if response.status != 200:
-                raise RuntimeError(
-                    f"Model healthcheck failed status={response.status} url={health_url} body={body[:500]}"
-                )
+    status = await build_worker_status()
+    if status["ok"] is not True:
+        raise RuntimeError(
+            f"Worker not ready phase={status['phase']} "
+            f"should_terminate={status['shouldTerminate']} "
+            f"fatal_signals={status['fatalSignals']} "
+            f"model_health={status['modelHealth']}"
+        )
 
     return {
         "ok": True,
-        "healthcheck_url": health_url,
+        "phase": status["phase"],
+        "healthcheck_url": status["modelHealth"].get("url"),
         "model_server_base_url": MODEL_SERVER_BASE_URL,
         "params": params,
     }
+
+
+async def statusz_remote(**params):
+    status = await build_worker_status()
+    status["params"] = params
+    return status
 
 
 bootstrap_handler_config = (
@@ -528,6 +764,13 @@ worker_config = WorkerConfig(
             max_queue_time=0.0,
             benchmark_config=None,
             remote_function=readyz_remote,
+        ),
+        HandlerConfig(
+            route=STATUS_ROUTE,
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=None,
+            remote_function=statusz_remote,
         ),
         HandlerConfig(
             route="/generate/sync",

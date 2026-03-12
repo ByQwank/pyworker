@@ -8,6 +8,7 @@ SERVER_DIR="$WORKSPACE_DIR/vast-pyworker"
 ENV_PATH="$WORKSPACE_DIR/worker-env"
 DEBUG_LOG="$WORKSPACE_DIR/debug.log"
 PYWORKER_LOG="$WORKSPACE_DIR/pyworker.log"
+STATUS_FILE="${PYWORKER_STATUS_FILE:-$WORKSPACE_DIR/pyworker-status.json}"
 PROVISIONING_DONE_MARKER="${PROVISIONING_DONE_MARKER:-$WORKSPACE_DIR/.provisioning-complete}"
 PROVISIONING_FAILED_MARKER="${PROVISIONING_FAILED_MARKER:-$WORKSPACE_DIR/.provisioning-failed}"
 PROVISIONING_WAIT_TIMEOUT_SECONDS="${PROVISIONING_WAIT_TIMEOUT_SECONDS:-2700}"
@@ -25,10 +26,51 @@ function echo_var(){
     echo "$1: ${!1}"
 }
 
+function update_status_file(){
+    local phase="$1"
+    local message="${2:-}"
+
+    if ! python3 - "$STATUS_FILE" "$phase" "$message" >/dev/null 2>&1 <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+phase = sys.argv[2]
+message = sys.argv[3]
+
+data = {}
+if path.exists():
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            data = raw
+    except Exception:
+        data = {}
+
+data["phase"] = phase
+data["message"] = message
+data["updatedAt"] = int(time.time() * 1000)
+data["pid"] = os.getpid()
+
+if phase == "failed":
+    data["errorMessage"] = message
+
+path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+PY
+    then
+        return 0
+    fi
+}
+
 function wait_for_provisioning_completion(){
     local wait_mode="${WAIT_FOR_PROVISIONING_MARKER:-auto}"
     local now
     local deadline
+
+    update_status_file "provisioning" "Waiting for provisioning to complete"
 
     if [ "$wait_mode" = "false" ]; then
         echo "Skipping provisioning wait because WAIT_FOR_PROVISIONING_MARKER=false"
@@ -70,6 +112,7 @@ function wait_for_provisioning_completion(){
 function report_error_and_exit(){
     local error_msg="$1"
     echo "ERROR: $error_msg"
+    update_status_file "failed" "$error_msg"
 
     MTOKEN="${MASTER_TOKEN:-}"
     VERSION="${PYWORKER_VERSION:-0}"
@@ -119,6 +162,8 @@ function install_vastai_sdk() {
     fi
 }
 
+update_status_file "booting" "start_server.sh bootstrapping"
+
 [ -z "$CONTAINER_ID" ] && report_error_and_exit "CONTAINER_ID must be set!"
 [ "$BACKEND" = "comfyui" ] && [ -z "$COMFY_MODEL" ] && report_error_and_exit "For comfyui backends, COMFY_MODEL must be set!"
 
@@ -133,6 +178,7 @@ echo_var SERVER_DIR
 echo_var ENV_PATH
 echo_var DEBUG_LOG
 echo_var PYWORKER_LOG
+echo_var STATUS_FILE
 echo_var MODEL_LOG
 echo_var PROVISIONING_DONE_MARKER
 echo_var PROVISIONING_FAILED_MARKER
@@ -266,6 +312,7 @@ if ! cd "$SERVER_DIR"; then
 fi
 
 wait_for_provisioning_completion
+update_status_file "starting" "Launching pyworker process"
 
 echo "launching PyWorker server"
 
@@ -275,19 +322,19 @@ PY_STATUS=1
 
 if [ -f "$SERVER_DIR/worker.py" ]; then
     echo "trying worker.py"
-    python3 -m "worker" |& tee -a "$PYWORKER_LOG"
+    python3 -m "worker" 2>&1 | tee -a "$PYWORKER_LOG"
     PY_STATUS=${PIPESTATUS[0]}
 fi
 
 if [ "${PY_STATUS}" -ne 0 ] && [ -f "$SERVER_DIR/workers/$BACKEND/worker.py" ]; then
     echo "trying workers.${BACKEND}.worker"
-    python3 -m "workers.${BACKEND}.worker" |& tee -a "$PYWORKER_LOG"
+    python3 -m "workers.${BACKEND}.worker" 2>&1 | tee -a "$PYWORKER_LOG"
     PY_STATUS=${PIPESTATUS[0]}
 fi
 
 if [ "${PY_STATUS}" -ne 0 ] && [ -f "$SERVER_DIR/workers/$BACKEND/server.py" ]; then
     echo "trying workers.${BACKEND}.server"
-    python3 -m "workers.${BACKEND}.server" |& tee -a "$PYWORKER_LOG"
+    python3 -m "workers.${BACKEND}.server" 2>&1 | tee -a "$PYWORKER_LOG"
     PY_STATUS=${PIPESTATUS[0]}
 fi
 
