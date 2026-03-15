@@ -22,6 +22,7 @@ PYWORKER_ENABLE_SERVER="${PYWORKER_ENABLE_SERVER:-${SERVERLESS:-false}}"
 export BOOTSTRAP_STATUS_PORT
 READY_ROUTE="${PYWORKER_READY_ROUTE:-/readyz}"
 STATUS_ROUTE="${PYWORKER_STATUS_ROUTE:-/statusz}"
+STATUS_SUMMARY_ROUTE="${PYWORKER_STATUS_SUMMARY_ROUTE:-/status-summaryz}"
 BOOTSTRAP_STATUS_PID=""
 mkdir -p "$WORKSPACE_DIR"
 cd "$WORKSPACE_DIR"
@@ -68,6 +69,10 @@ from urllib import error, request
 BOOTSTRAP_STATUS_PORT = int(os.getenv("BOOTSTRAP_STATUS_PORT", "3000"))
 READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
 STATUS_ROUTE = os.getenv("PYWORKER_STATUS_ROUTE", "/statusz").strip() or "/statusz"
+STATUS_SUMMARY_ROUTE = (
+    os.getenv("PYWORKER_STATUS_SUMMARY_ROUTE", "/status-summaryz").strip()
+    or "/status-summaryz"
+)
 STATUS_FILE = Path(os.getenv("PYWORKER_STATUS_FILE", "/workspace/pyworker-status.json"))
 DEBUG_LOG_FILE = Path(os.getenv("PYWORKER_DEBUG_LOG_FILE", "/workspace/debug.log"))
 PYWORKER_LOG_FILE = Path(os.getenv("PYWORKER_LOG_FILE", "/workspace/pyworker.log"))
@@ -83,6 +88,7 @@ LOW_DISK_FREE_BYTES = int(
     os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
 )
 STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
+STATUS_SUMMARY_CACHE_MS = int(os.getenv("PYWORKER_STATUS_SUMMARY_CACHE_MS", "10000"))
 MODEL_SERVER_BASE_URL = (
     os.getenv("PYWORKER_HEALTHCHECK_BASE_URL", os.getenv("PYWORKER_MODEL_SERVER_BASE_URL", "http://127.0.0.1:18288"))
     .strip()
@@ -182,6 +188,9 @@ GENERATION_PROGRESS_RE = re.compile(
 )
 PROVISIONING_PROGRESS_PERCENT_RE = re.compile(r"\((?P<percent>\d{1,3})%\)")
 PROMPT_EXECUTED_RE = re.compile(r"Prompt executed in (?P<seconds>[\d.]+) seconds")
+
+_summary_cache = None
+_summary_cache_expires_at = 0
 
 
 def safe_read_json(path: Path) -> dict:
@@ -557,6 +566,54 @@ def build_status() -> dict:
     }
 
 
+def build_status_summary_payload(status: dict) -> dict:
+    message = None
+    activity = status.get("activity")
+    if isinstance(activity, dict):
+        raw_message = activity.get("message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            message = raw_message
+
+    if message is None:
+        raw_message = status.get("message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            message = raw_message
+
+    error_message = status.get("errorMessage")
+
+    return {
+        "ok": status.get("ok"),
+        "phase": status.get("phase"),
+        "shouldTerminate": status.get("shouldTerminate"),
+        "message": message,
+        "errorMessage": error_message if isinstance(error_message, str) else None,
+        "fatalSignals": status.get("fatalSignals"),
+        "provisioning": status.get("provisioning"),
+        "modelHealth": status.get("modelHealth"),
+        "activity": status.get("activity"),
+        "bootstrapServer": True,
+        "updatedAt": status.get("updatedAt"),
+    }
+
+
+def build_status_summary(force_refresh: bool = False) -> dict:
+    global _summary_cache, _summary_cache_expires_at
+
+    now = int(time.time() * 1000)
+    if (
+        not force_refresh
+        and isinstance(_summary_cache, dict)
+        and now < _summary_cache_expires_at
+    ):
+        return dict(_summary_cache)
+
+    status = build_status()
+    summary = build_status_summary_payload(status)
+    _summary_cache = summary
+    _summary_cache_expires_at = now + max(0, STATUS_SUMMARY_CACHE_MS)
+    return dict(summary)
+
+
 class BootstrapStatusHandler(BaseHTTPRequestHandler):
     server_version = "PyworkerBootstrapStatus/1.0"
 
@@ -593,7 +650,7 @@ class BootstrapStatusHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path not in {READY_ROUTE, STATUS_ROUTE, "/health"}:
+        if self.path not in {READY_ROUTE, STATUS_ROUTE, STATUS_SUMMARY_ROUTE, "/health"}:
             self._write_json({"error": "not_found"}, 404)
             return
 
@@ -601,8 +658,16 @@ class BootstrapStatusHandler(BaseHTTPRequestHandler):
             self._write_json({"error": "unauthorized"}, 401)
             return
 
-        status_payload = build_status()
+        status_payload = (
+            build_status()
+            if self.path == STATUS_ROUTE
+            else build_status_summary()
+        )
         if self.path == STATUS_ROUTE:
+            self._write_json(status_payload, 200)
+            return
+
+        if self.path == STATUS_SUMMARY_ROUTE:
             self._write_json(status_payload, 200)
             return
 

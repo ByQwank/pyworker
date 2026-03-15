@@ -8,8 +8,9 @@ This fork is intentionally minimal and only keeps the `comfyui-json` backend use
 - `start_server.sh` - startup bootstrap script used by Vast templates
 - `default.sh` - current provisioning script to use from template `PROVISIONING_SCRIPT`
 - `GET /readyz` - readiness route for Trigger/Vast boot checks
+- `GET /status-summaryz` - cached lightweight status for routine polling
 - `GET /statusz` - structured machine status, fatal signals, disk state, and recent log tails
-- bootstrap status server on the raw PyWorker port so `/statusz` is reachable during provisioning before the real worker starts
+- bootstrap status server on the raw PyWorker port so `/status-summaryz` and `/statusz` are reachable during provisioning before the real worker starts
 
 ## What was removed
 
@@ -36,6 +37,8 @@ Optional:
 - `SDK_VERSION=<vastai-sdk version>`
 - `PYWORKER_REQUIRE_MANIFEST=auto|true|false` (default `auto`, requires signed manifests when secret is set)
 - `PYWORKER_MANIFEST_ENDPOINT=direct-instance` (must match Trigger manifest endpoint)
+- `PYWORKER_STATUS_SUMMARY_ROUTE=/status-summaryz`
+- `PYWORKER_STATUS_SUMMARY_CACHE_MS=10000`
 
 ## Provision script raw URL
 

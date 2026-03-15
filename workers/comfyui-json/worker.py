@@ -40,6 +40,10 @@ MODEL_HEALTHCHECK_ENDPOINT = (
 )
 READY_ROUTE = os.getenv("PYWORKER_READY_ROUTE", "/readyz").strip() or "/readyz"
 STATUS_ROUTE = os.getenv("PYWORKER_STATUS_ROUTE", "/statusz").strip() or "/statusz"
+STATUS_SUMMARY_ROUTE = (
+    os.getenv("PYWORKER_STATUS_SUMMARY_ROUTE", "/status-summaryz").strip()
+    or "/status-summaryz"
+)
 PROVISIONING_DONE_MARKER = Path(
     os.getenv("PROVISIONING_DONE_MARKER", "/workspace/.provisioning-complete")
 )
@@ -54,6 +58,7 @@ LOW_DISK_FREE_BYTES = int(
     os.getenv("PYWORKER_LOW_DISK_FREE_BYTES", str(5 * 1024 * 1024 * 1024))
 )
 STATUS_BODY_PREVIEW_LIMIT = int(os.getenv("PYWORKER_STATUS_BODY_PREVIEW_LIMIT", "500"))
+STATUS_SUMMARY_CACHE_MS = int(os.getenv("PYWORKER_STATUS_SUMMARY_CACHE_MS", "10000"))
 
 # ComyUI-specific log messages
 MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
@@ -175,6 +180,9 @@ GENERATION_PROGRESS_RE = re.compile(
 )
 PROVISIONING_PROGRESS_PERCENT_RE = re.compile(r"\((?P<percent>\d{1,3})%\)")
 PROMPT_EXECUTED_RE = re.compile(r"Prompt executed in (?P<seconds>[\d.]+) seconds")
+
+_status_summary_cache: dict[str, Any] | None = None
+_status_summary_cache_expires_at = 0
 
 
 def safe_read_json_file(path: Path) -> dict[str, Any]:
@@ -577,6 +585,49 @@ async def build_worker_status() -> dict[str, Any]:
     }
 
 
+def build_worker_status_summary_payload(status: dict[str, Any]) -> dict[str, Any]:
+    status_file = (
+        status.get("statusFile") if isinstance(status.get("statusFile"), dict) else {}
+    )
+    activity = status.get("activity") if isinstance(status.get("activity"), dict) else {}
+    message = activity.get("message")
+    if not isinstance(message, str) or not message.strip():
+        message = status_file.get("message")
+    error_message = status_file.get("errorMessage")
+
+    return {
+        "ok": status.get("ok"),
+        "phase": status.get("phase"),
+        "shouldTerminate": status.get("shouldTerminate"),
+        "instance": status.get("instance"),
+        "provisioning": status.get("provisioning"),
+        "modelHealth": status.get("modelHealth"),
+        "activity": status.get("activity"),
+        "fatalSignals": status.get("fatalSignals"),
+        "message": message,
+        "errorMessage": error_message if isinstance(error_message, str) else None,
+        "updatedAt": status.get("updatedAt"),
+    }
+
+
+async def build_worker_status_summary(force_refresh: bool = False) -> dict[str, Any]:
+    global _status_summary_cache, _status_summary_cache_expires_at
+
+    now = int(time.time() * 1000)
+    if (
+        not force_refresh
+        and _status_summary_cache is not None
+        and now < _status_summary_cache_expires_at
+    ):
+        return dict(_status_summary_cache)
+
+    status = await build_worker_status()
+    summary = build_worker_status_summary_payload(status)
+    _status_summary_cache = summary
+    _status_summary_cache_expires_at = now + max(0, STATUS_SUMMARY_CACHE_MS)
+    return dict(summary)
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -952,7 +1003,7 @@ async def bootstrap_ping_remote(**params):
 
 
 async def readyz_remote(**params):
-    status = await build_worker_status()
+    status = await build_worker_status_summary()
     if status["ok"] is not True:
         raise RuntimeError(
             f"Worker not ready phase={status['phase']} "
@@ -972,6 +1023,12 @@ async def readyz_remote(**params):
 
 async def statusz_remote(**params):
     status = await build_worker_status()
+    status["params"] = params
+    return status
+
+
+async def status_summary_remote(**params):
+    status = await build_worker_status_summary()
     status["params"] = params
     return status
 
@@ -1013,6 +1070,13 @@ worker_config = WorkerConfig(
             max_queue_time=0.0,
             benchmark_config=None,
             remote_function=statusz_remote,
+        ),
+        HandlerConfig(
+            route=STATUS_SUMMARY_ROUTE,
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=None,
+            remote_function=status_summary_remote,
         ),
         HandlerConfig(
             route="/generate/sync",
