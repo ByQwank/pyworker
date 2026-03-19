@@ -12,6 +12,16 @@ LORA_PATH="${MODELS_DIR}/loras"
 MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 PROVISIONING_DONE_MARKER="${PROVISIONING_DONE_MARKER:-${WORKSPACE_ROOT}/.provisioning-complete}"
 PROVISIONING_FAILED_MARKER="${PROVISIONING_FAILED_MARKER:-${WORKSPACE_ROOT}/.provisioning-failed}"
+BOOTSTRAP_MANIFEST_B64="${PYWORKER_BOOTSTRAP_MANIFEST_B64:-}"
+BOOTSTRAP_MANIFEST_SECRET="${PYWORKER_BOOTSTRAP_MANIFEST_SECRET:-${PYWORKER_MANIFEST_SECRET:-}}"
+BOOTSTRAP_MANIFEST_ENDPOINT="${PYWORKER_BOOTSTRAP_MANIFEST_ENDPOINT:-${PYWORKER_MANIFEST_ENDPOINT:-direct-instance}}"
+BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS="${PYWORKER_BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS:-900}"
+SELECTED_WORKFLOW_PROFILE=""
+SELECTED_DEPENDENCY_PROFILE=""
+export BOOTSTRAP_MANIFEST_B64
+export BOOTSTRAP_MANIFEST_SECRET
+export BOOTSTRAP_MANIFEST_ENDPOINT
+export BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS
 
 APT_PACKAGES=(
     "aria2"
@@ -85,6 +95,7 @@ HF_MODELS=(
 # RIFE model for frame interpolation (goes into custom node, not models dir)
 RIFE_URL="https://huggingface.co/hfmaster/models-moved/resolve/cab6dcee2fbb05e190dbb8f536fbdaa489031a14/rife/rife49.pth"
 RIFE_PATH="${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/models/rife/rife49.pth"
+ADDITIONAL_MODEL_DOWNLOADS=()
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
@@ -92,9 +103,201 @@ log() {
     printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$1"
 }
 
+function append_unique() {
+    local value="$1"
+    local array_name="$2"
+    local -n target_array="$array_name"
+
+    for existing in "${target_array[@]}"; do
+        if [[ "$existing" == "$value" ]]; then
+            return 0
+        fi
+    done
+
+    target_array+=("$value")
+}
+
+function repo_spec_url() {
+    local repo_spec="$1"
+    printf "%s" "${repo_spec%%|*}"
+}
+
+function repo_spec_ref() {
+    local repo_spec="$1"
+    if [[ "$repo_spec" == *"|"* ]]; then
+        printf "%s" "${repo_spec#*|}"
+    fi
+}
+
+function repo_spec_dir() {
+    local repo_url
+    repo_url="$(repo_spec_url "$1")"
+    local dir_name="${repo_url##*/}"
+    printf "%s" "${dir_name%.git}"
+}
+
+function provisioning_apply_bootstrap_manifest() {
+    if [[ -z "$BOOTSTRAP_MANIFEST_B64" ]]; then
+        return 0
+    fi
+
+    log "Applying workflow bootstrap manifest..."
+
+    local manifest_lines
+    if ! manifest_lines="$(
+        python3 - <<'PY' 2>&1
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+
+
+def canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+manifest_b64 = os.getenv("BOOTSTRAP_MANIFEST_B64", "").strip()
+if not manifest_b64:
+    raise SystemExit(0)
+
+padding = "=" * (-len(manifest_b64) % 4)
+try:
+    decoded = base64.urlsafe_b64decode(f"{manifest_b64}{padding}".encode("utf-8"))
+    manifest = json.loads(decoded.decode("utf-8"))
+except Exception as error:
+    raise SystemExit(f"Invalid PYWORKER_BOOTSTRAP_MANIFEST_B64: {error}")
+
+if not isinstance(manifest, dict):
+    raise SystemExit("Bootstrap manifest must decode to a JSON object.")
+
+endpoint = manifest.get("endpoint")
+generation_id = manifest.get("generationId")
+issued_at = manifest.get("issuedAt")
+signature = manifest.get("signature")
+
+if not isinstance(endpoint, str) or not endpoint:
+    raise SystemExit("Bootstrap manifest endpoint is required.")
+if not isinstance(generation_id, str) or not generation_id:
+    raise SystemExit("Bootstrap manifest generationId is required.")
+if not isinstance(issued_at, (int, float)):
+    raise SystemExit("Bootstrap manifest issuedAt must be numeric.")
+
+expected_endpoint = os.getenv("BOOTSTRAP_MANIFEST_ENDPOINT", "").strip()
+if expected_endpoint and endpoint != expected_endpoint:
+    raise SystemExit(
+        f"Bootstrap manifest endpoint mismatch. expected='{expected_endpoint}' got='{endpoint}'"
+    )
+
+secret = os.getenv("BOOTSTRAP_MANIFEST_SECRET", "").strip()
+if secret:
+    if not isinstance(signature, str) or not signature:
+        raise SystemExit("Bootstrap manifest signature is required.")
+
+    max_age_seconds = int(os.getenv("BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS", "900"))
+    age_ms = abs(int(time.time() * 1000) - int(issued_at))
+    if age_ms > max_age_seconds * 1000:
+        raise SystemExit("Bootstrap manifest signature expired.")
+
+    payload_to_sign = {
+        "assetDownloads": manifest.get("assetDownloads") or [],
+        "customNodeRepos": manifest.get("customNodeRepos") or [],
+        "dependencyProfileSlug": manifest.get("dependencyProfileSlug"),
+        "endpoint": endpoint,
+        "generationId": generation_id,
+        "issuedAt": int(issued_at),
+        "pipPackages": manifest.get("pipPackages") or [],
+        "workflowProfileSlug": manifest.get("workflowProfileSlug"),
+    }
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        canonical_json(payload_to_sign).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise SystemExit("Bootstrap manifest signature mismatch.")
+
+workflow_profile_slug = manifest.get("workflowProfileSlug")
+if isinstance(workflow_profile_slug, str) and workflow_profile_slug.strip():
+    print(f"workflow\t{workflow_profile_slug.strip()}")
+
+dependency_profile_slug = manifest.get("dependencyProfileSlug")
+if isinstance(dependency_profile_slug, str) and dependency_profile_slug.strip():
+    print(f"dependency\t{dependency_profile_slug.strip()}")
+
+for package in manifest.get("pipPackages") or []:
+    if isinstance(package, str) and package.strip():
+        print(f"pip\t{package.strip()}")
+
+for repo in manifest.get("customNodeRepos") or []:
+    if not isinstance(repo, dict):
+        raise SystemExit("customNodeRepos entries must be objects.")
+    repo_url = repo.get("repoUrl")
+    repo_ref = repo.get("ref")
+    if not isinstance(repo_url, str) or not repo_url.strip():
+        raise SystemExit("customNodeRepos.repoUrl is required.")
+    if repo_ref is not None and not isinstance(repo_ref, str):
+        raise SystemExit("customNodeRepos.ref must be a string when provided.")
+    print(f"node\t{repo_url.strip()}\t{(repo_ref or '').strip()}")
+
+for asset in manifest.get("assetDownloads") or []:
+    if not isinstance(asset, dict):
+        raise SystemExit("assetDownloads entries must be objects.")
+    asset_url = asset.get("url")
+    target_path = asset.get("targetPath")
+    if not isinstance(asset_url, str) or not asset_url.strip():
+        raise SystemExit("assetDownloads.url is required.")
+    if not isinstance(target_path, str) or not target_path.strip():
+        raise SystemExit("assetDownloads.targetPath is required.")
+    print(f"asset\t{asset_url.strip()}\t{target_path.strip()}")
+PY
+    )"; then
+        log "[ERROR] Failed to parse workflow bootstrap manifest: ${manifest_lines}"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r kind first second; do
+        [[ -n "$kind" ]] || continue
+
+        case "$kind" in
+            workflow)
+                SELECTED_WORKFLOW_PROFILE="$first"
+                ;;
+            dependency)
+                SELECTED_DEPENDENCY_PROFILE="$first"
+                ;;
+            pip)
+                append_unique "$first" PIP_PACKAGES
+                ;;
+            node)
+                if [[ -n "$second" ]]; then
+                    append_unique "${first}|${second}" NODES
+                else
+                    append_unique "$first" NODES
+                fi
+                ;;
+            asset)
+                append_unique "${first}|${second}" ADDITIONAL_MODEL_DOWNLOADS
+                ;;
+        esac
+    done <<< "$manifest_lines"
+
+    if [[ -n "$SELECTED_WORKFLOW_PROFILE" ]]; then
+        log "Workflow profile: ${SELECTED_WORKFLOW_PROFILE}"
+    fi
+
+    if [[ -n "$SELECTED_DEPENDENCY_PROFILE" ]]; then
+        log "Dependency profile: ${SELECTED_DEPENDENCY_PROFILE}"
+    fi
+}
+
 function provisioning_start() {
     provisioning_print_header
     rm -f "$PROVISIONING_DONE_MARKER" "$PROVISIONING_FAILED_MARKER"
+
+    provisioning_apply_bootstrap_manifest || return 1
 
     # Phase 1: System deps + pip (sequential, fast)
     provisioning_get_apt_packages || return 1
@@ -160,19 +363,30 @@ function provisioning_get_pip_packages() {
 }
 
 function clone_or_update_repo() {
-    local repo="$1"
+    local repo_spec="$1"
     local path="$2"
+    local repo
+    local ref
     local attempt
 
+    repo="$(repo_spec_url "$repo_spec")"
+    ref="$(repo_spec_ref "$repo_spec")"
+
     if [[ -d "$path/.git" ]]; then
-        if [[ ${AUTO_UPDATE,,} == "false" ]]; then
+        if [[ ${AUTO_UPDATE,,} == "false" && -z "$ref" ]]; then
             return 0
         fi
 
         for attempt in 1 2 3; do
             if (
                 cd "$path" &&
-                git pull --ff-only >/dev/null 2>&1 &&
+                git remote set-url origin "$repo" >/dev/null 2>&1 &&
+                if [[ -n "$ref" ]]; then
+                    git fetch --depth 1 origin "$ref" >/dev/null 2>&1 || git fetch origin "$ref" >/dev/null 2>&1
+                    git checkout --detach FETCH_HEAD >/dev/null 2>&1 || git checkout "$ref" >/dev/null 2>&1
+                else
+                    git pull --ff-only >/dev/null 2>&1
+                fi &&
                 git submodule update --init --recursive >/dev/null 2>&1
             ); then
                 return 0
@@ -185,12 +399,48 @@ function clone_or_update_repo() {
     rm -rf "$path"
     for attempt in 1 2 3; do
         if git clone --depth 1 --single-branch --recursive --jobs 8 "$repo" "$path" >/dev/null 2>&1; then
-            return 0
+            if [[ -n "$ref" ]]; then
+                if (
+                    cd "$path" &&
+                    (
+                        git fetch --depth 1 origin "$ref" >/dev/null 2>&1 ||
+                        git fetch origin "$ref" >/dev/null 2>&1
+                    ) &&
+                    (
+                        git checkout --detach FETCH_HEAD >/dev/null 2>&1 ||
+                        git checkout "$ref" >/dev/null 2>&1
+                    ) &&
+                    git submodule update --init --recursive >/dev/null 2>&1
+                ); then
+                    return 0
+                fi
+                rm -rf "$path"
+            else
+                return 0
+            fi
         fi
 
         rm -rf "$path"
         if git clone --recursive --jobs 8 "$repo" "$path" >/dev/null 2>&1; then
-            return 0
+            if [[ -n "$ref" ]]; then
+                if (
+                    cd "$path" &&
+                    (
+                        git fetch --depth 1 origin "$ref" >/dev/null 2>&1 ||
+                        git fetch origin "$ref" >/dev/null 2>&1
+                    ) &&
+                    (
+                        git checkout --detach FETCH_HEAD >/dev/null 2>&1 ||
+                        git checkout "$ref" >/dev/null 2>&1
+                    ) &&
+                    git submodule update --init --recursive >/dev/null 2>&1
+                ); then
+                    return 0
+                fi
+                rm -rf "$path"
+            else
+                return 0
+            fi
         fi
 
         rm -rf "$path"
@@ -206,11 +456,12 @@ function provisioning_get_nodes_parallel() {
     local pids=()
     local failed=0
 
-    for repo in "${NODES[@]}"; do
-        dir="${repo##*/}"
+    for repo_spec in "${NODES[@]}"; do
+        local dir
+        dir="$(repo_spec_dir "$repo_spec")"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         (
-            if ! clone_or_update_repo "$repo" "$path"; then
+            if ! clone_or_update_repo "$repo_spec" "$path"; then
                 log "[ERROR] Failed to prepare custom node ${dir}"
                 exit 1
             fi
@@ -236,8 +487,9 @@ function provisioning_get_nodes_parallel() {
 # Install requirements for all custom nodes
 function provisioning_install_node_requirements() {
     log "Installing custom node requirements..."
-    for repo in "${NODES[@]}"; do
-        dir="${repo##*/}"
+    for repo_spec in "${NODES[@]}"; do
+        local dir
+        dir="$(repo_spec_dir "$repo_spec")"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
         if [[ -e $requirements ]]; then
@@ -551,12 +803,15 @@ function provisioning_download_all_models_parallel() {
         auth_header="Authorization: Bearer ${HF_TOKEN}"
     fi
 
-    # Add HF models to aria2 input
-    for model in "${HF_MODELS[@]}"; do
+    # Add base and workflow-specific model downloads
+    for model in "${HF_MODELS[@]}" "${ADDITIONAL_MODEL_DOWNLOADS[@]}"; do
+        [[ -n "$model" ]] || continue
         local url="${model%%|*}"
         local output_path="${model##*|}"
         local dir=$(dirname "$output_path")
         local filename=$(basename "$output_path")
+
+        mkdir -p "$dir"
 
         # Skip if already downloaded
         if [[ -f "$output_path" ]]; then
