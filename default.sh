@@ -18,6 +18,7 @@ BOOTSTRAP_MANIFEST_ENDPOINT="${PYWORKER_BOOTSTRAP_MANIFEST_ENDPOINT:-${PYWORKER_
 BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS="${PYWORKER_BOOTSTRAP_MANIFEST_MAX_AGE_SECONDS:-900}"
 SELECTED_WORKFLOW_PROFILE=""
 SELECTED_DEPENDENCY_PROFILE=""
+BOOTSTRAP_MANIFEST_ACTIVE="false"
 export BOOTSTRAP_MANIFEST_B64
 export BOOTSTRAP_MANIFEST_SECRET
 export BOOTSTRAP_MANIFEST_ENDPOINT
@@ -29,33 +30,9 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "huggingface_hub[hf_transfer]"
-    "lark"
-    "sentencepiece"
-    "opencv-python-headless"
-    "spandrel"
-    "peft"
-    "clip_interrogator>=0.6.0"
-    "color-matcher"
-    "colorama"
-    "scipy"
-    "matplotlib"
-    "gguf"
-    "einops>=0.8"
 )
 
 NODES=(
-    "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/city96/ComfyUI-GGUF"
-    "https://github.com/kijai/ComfyUI-WanVideoWrapper"
-    "https://github.com/yolain/ComfyUI-Easy-Use"
-    "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/kijai/ComfyUI-KJNodes"
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
-    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
-    "https://github.com/SeanScripts/ComfyUI-Unload-Model"
-    "https://github.com/rgthree/rgthree-comfy"
-    "https://github.com/WASasquatch/was-node-suite-comfyui"
 )
 
 WORKFLOWS=(
@@ -70,8 +47,6 @@ UNET_MODELS=(
 # Preload the 4-step lighting LoRAs used in every generation
 # Other LoRAs are downloaded on demand by pyworker via ensure_lora_downloaded()
 LORA_MODELS=(
-    "https://huggingface.co/Dylaaann/Lora/resolve/main/high_4step.safetensors"
-    "https://huggingface.co/Dylaaann/Lora/resolve/main/low_4step.safetensors"
 )
 
 VAE_MODELS=(
@@ -86,15 +61,10 @@ CONTROLNET_MODELS=(
 # HuggingFace models downloaded via hf_transfer for max speed
 # Format: "URL|OUTPUT_PATH"
 HF_MODELS=(
-    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors|${MODELS_DIR}/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors|${MODELS_DIR}/vae/wan_2.1_vae.safetensors"
-    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors|${MODELS_DIR}/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
-    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors|${MODELS_DIR}/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
 )
 
-# RIFE model for frame interpolation (goes into custom node, not models dir)
-RIFE_URL="https://huggingface.co/hfmaster/models-moved/resolve/cab6dcee2fbb05e190dbb8f536fbdaa489031a14/rife/rife49.pth"
-RIFE_PATH="${COMFYUI_DIR}/custom_nodes/ComfyUI-Frame-Interpolation/models/rife/rife49.pth"
+RIFE_URL=""
+RIFE_PATH=""
 ADDITIONAL_MODEL_DOWNLOADS=()
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
@@ -138,10 +108,12 @@ function repo_spec_dir() {
 
 function provisioning_apply_bootstrap_manifest() {
     if [[ -z "$BOOTSTRAP_MANIFEST_B64" ]]; then
-        return 0
+        log "[ERROR] Missing PYWORKER_BOOTSTRAP_MANIFEST_B64"
+        return 1
     fi
 
     log "Applying workflow bootstrap manifest..."
+    BOOTSTRAP_MANIFEST_ACTIVE="true"
 
     local manifest_lines
     if ! manifest_lines="$(
@@ -794,7 +766,9 @@ function provisioning_download_all_models_parallel() {
     mkdir -p "${MODELS_DIR}/diffusion_models"
     mkdir -p "${MODELS_DIR}/vae"
     mkdir -p "${MODELS_DIR}/loras"
-    mkdir -p "$(dirname "$RIFE_PATH")"
+    if [[ -n "$RIFE_PATH" ]]; then
+        mkdir -p "$(dirname "$RIFE_PATH")"
+    fi
 
     local aria2_input=$(mktemp)
     local auth_header=""
@@ -828,7 +802,7 @@ function provisioning_download_all_models_parallel() {
     done
 
     # Add RIFE model
-    if [[ ! -f "$RIFE_PATH" ]]; then
+    if [[ -n "$RIFE_URL" && -n "$RIFE_PATH" && ! -f "$RIFE_PATH" ]]; then
         echo "$RIFE_URL" >> "$aria2_input"
         echo "  dir=$(dirname "$RIFE_PATH")" >> "$aria2_input"
         echo "  out=$(basename "$RIFE_PATH")" >> "$aria2_input"
@@ -918,16 +892,22 @@ function provisioning_verify() {
     log "Verifying critical files..."
     local failed=0
 
-    # Verify base models
-    local critical_files=(
-        "${MODELS_DIR}/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-        "${MODELS_DIR}/vae/wan_2.1_vae.safetensors"
-        "${MODELS_DIR}/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
-        "${MODELS_DIR}/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
-        "$RIFE_PATH"
-        "${MODELS_DIR}/loras/high_4step.safetensors"
-        "${MODELS_DIR}/loras/low_4step.safetensors"
-    )
+    local critical_files=()
+
+    for model in "${HF_MODELS[@]}" "${ADDITIONAL_MODEL_DOWNLOADS[@]}"; do
+        [[ -n "$model" ]] || continue
+        local output_path="${model##*|}"
+        append_unique "$output_path" critical_files
+    done
+
+    for url in "${LORA_MODELS[@]}"; do
+        [[ -n "$url" ]] || continue
+        append_unique "${MODELS_DIR}/loras/$(basename "$url")" critical_files
+    done
+
+    if [[ -n "$RIFE_PATH" ]]; then
+        append_unique "$RIFE_PATH" critical_files
+    fi
 
     for f in "${critical_files[@]}"; do
         if [[ -f "$f" ]]; then
@@ -939,8 +919,12 @@ function provisioning_verify() {
         fi
     done
 
-    # Verify critical custom nodes
-    local critical_nodes=("ComfyUI-Easy-Use" "ComfyUI-WanVideoWrapper" "ComfyUI-KJNodes" "ComfyUI-VideoHelperSuite" "ComfyUI-Frame-Interpolation")
+    local critical_nodes=()
+    for repo_spec in "${NODES[@]}"; do
+        [[ -n "$repo_spec" ]] || continue
+        append_unique "$(repo_spec_dir "$repo_spec")" critical_nodes
+    done
+
     for node in "${critical_nodes[@]}"; do
         if [[ -d "${COMFYUI_DIR}/custom_nodes/${node}" ]]; then
             log "✓ Node: ${node}"
