@@ -287,35 +287,6 @@ def extract_recent_progress(logs: dict[str, str | None]) -> dict[str, Any] | Non
     return None
 
 
-def extract_runtime_metrics(logs: dict[str, str | None]) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
-
-    for source in ("modelTail", "pyworkerTail", "debugTail"):
-        text = logs.get(source)
-        if not isinstance(text, str):
-            continue
-
-        for raw_line in reversed(text.splitlines()):
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            prompt_executed = PROMPT_EXECUTED_RE.search(line)
-            if not prompt_executed:
-                continue
-
-            try:
-                prompt_execution_seconds = float(prompt_executed.group("seconds"))
-            except ValueError:
-                continue
-
-            metrics["promptExecutionMs"] = max(0, round(prompt_execution_seconds * 1000))
-            metrics["promptExecutionSource"] = source
-            return metrics
-
-    return metrics
-
-
 def extract_activity(
     *,
     status_file: dict[str, Any],
@@ -590,7 +561,6 @@ async def build_worker_status() -> dict[str, Any]:
         logs=logs,
         phase=phase,
     )
-    metrics = extract_runtime_metrics(logs)
 
     return {
         "ok": phase == "ready",
@@ -608,7 +578,6 @@ async def build_worker_status() -> dict[str, Any]:
         "modelHealth": health,
         "disk": disk,
         "activity": activity,
-        "metrics": metrics,
         "fatalSignals": log_signals,
         "statusFile": status_file,
         "logs": logs,
@@ -634,7 +603,6 @@ def build_worker_status_summary_payload(status: dict[str, Any]) -> dict[str, Any
         "provisioning": status.get("provisioning"),
         "modelHealth": status.get("modelHealth"),
         "activity": status.get("activity"),
-        "metrics": status.get("metrics"),
         "fatalSignals": status.get("fatalSignals"),
         "message": message,
         "errorMessage": error_message if isinstance(error_message, str) else None,
